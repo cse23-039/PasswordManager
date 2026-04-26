@@ -1,0 +1,84 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — Password Manager
+# Requirement 4: Containerisation & deployment support
+# ─────────────────────────────────────────────────────────────────────────────
+version: "3.9"
+
+services:
+
+  # ── Main application ─────────────────────────────────────────────────────
+  password-manager:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: password-manager:latest
+    container_name: password-manager
+    restart: unless-stopped
+
+    environment:
+      - VAULT_PATH=/data/vault.pwm
+      - PM_LOG_LEVEL=info
+      # Session & lockout (override defaults if needed)
+      # - PM_SESSION_TIMEOUT_MINS=30
+      # - PM_LOCKOUT_DURATION_MINS=15
+      # - PM_MAX_FAILED_ATTEMPTS=5
+      # MFA
+      # - PM_MFA_REQUIRED=true
+      # TLS (for future network mode)
+      # - PM_TLS_CERT_FILE=/certs/server.crt
+      # - PM_TLS_KEY_FILE=/certs/server.key
+
+    volumes:
+      # Persist encrypted vault and audit log outside the container
+      - vault-data:/data
+      # Optional: bind-mount host certificates for TLS
+      # - ./certs:/certs:ro
+
+    # Forward display for desktop (Linux host with X11)
+    # environment:
+    #   - DISPLAY=${DISPLAY}
+    # volumes:
+    #   - /tmp/.X11-unix:/tmp/.X11-unix
+
+    # No network ports are needed for a local desktop vault.
+    # Uncomment below if a future HTTP API is added.
+    # ports:
+    #   - "8443:8443"
+
+    # Drop all Linux capabilities – application needs none
+    cap_drop:
+      - ALL
+
+    # Read-only root filesystem; writable only via volume mounts
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    security_opt:
+      - no-new-privileges:true
+
+  # ── Security self-check tool ──────────────────────────────────────────────
+  security-check:
+    image: password-manager:latest
+    container_name: security-check
+    entrypoint: ["/usr/local/bin/security-check"]
+    profiles:
+      - tools          # only starts with: docker compose --profile tools up
+    volumes:
+      - vault-data:/data
+    environment:
+      - VAULT_PATH=/data/vault.pwm
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  vault-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      # Change this path to the desired host directory for the encrypted vault
+      device: "${VAULT_DIR:-./vault-data}"

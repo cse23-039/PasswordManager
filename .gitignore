@@ -1,0 +1,40 @@
+# Build output
+bin/
+dist/
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Vault data files — never commit credentials or audit logs
+data/
+*.pwm
+*.pwm.users
+*.pwm.audit
+*.pwm.seed
+*.tmp
+
+# Installer output
+installer/windows/Output/
+installer/macos/Output/
+installer/linux/Output/
+
+# Go toolchain
+*.test
+*.out
+vendor/
+
+# Claude Code local files
+.claude/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db

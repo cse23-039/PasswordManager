@@ -1,0 +1,136 @@
+name: Build & Release
+
+on:
+  push:
+    branches: ["main", "master"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: write
+
+jobs:
+  # ─── Tests ───────────────────────────────────────────────────────────────────
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Install Fyne system deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+            libxi-dev libgl1-mesa-dev libxxf86vm-dev pkg-config
+
+      - run: go vet ./...
+      - run: go test ./internal/... -v -count=1 -timeout 120s
+
+  # ─── Build matrix ────────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bin: password-manager.exe
+            ldflags: "-s -w -H windowsgui"
+          - os: ubuntu-latest
+            bin: password-manager-linux
+            ldflags: "-s -w"
+          - os: macos-latest
+            bin: password-manager-macos
+            ldflags: "-s -w"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          if [[ -z "$VERSION" || "$VERSION" == "$TAG" ]]; then
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+            libxi-dev libgl1-mesa-dev libxxf86vm-dev pkg-config
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: xcode-select --install 2>/dev/null || true
+
+      - name: Build binary
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p bin
+          go build \
+            -ldflags="${{ matrix.ldflags }} -X main.Version=${{ steps.ver.outputs.version }}" \
+            -o "bin/${{ matrix.bin }}" \
+            ./cmd/password-manager
+
+      # Windows only: compile the Inno Setup installer on release tags
+      - name: Build Windows installer
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $env:PATH = "C:\Program Files (x86)\Inno Setup 6;$env:PATH"
+          iscc /DAppVersion="${{ steps.ver.outputs.version }}" installer\windows\setup.iss
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bin }}
+          path: bin/${{ matrix.bin }}
+          retention-days: 7
+
+      - name: Upload installer artifact (Windows release only)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: installer\windows\Output\*.exe
+          retention-days: 7
+
+  # ─── GitHub Release ───────────────────────────────────────────────────────────
+  release:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true

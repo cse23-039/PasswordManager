@@ -13,7 +13,7 @@ import (
 	"github.com/minio/selfupdate"
 )
 
-const repoAPI = "https://api.github.com/repos/KagisoSetwaba/password-manager/releases/latest"
+const repoAPI = "https://api.github.com/repos/cse23-039/PasswordManager/releases/latest"
 
 // releasePublicKey is the minisign Ed25519 public key used to verify release binaries.
 // Generate a key pair with: minisign -G

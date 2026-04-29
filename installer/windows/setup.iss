@@ -16,9 +16,9 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
-AppPublisherURL=https://github.com/KagisoSetwaba/password-manager
-AppSupportURL=https://github.com/KagisoSetwaba/password-manager/issues
-AppUpdatesURL=https://github.com/KagisoSetwaba/password-manager/releases
+AppPublisherURL=https://github.com/cse23-039/PasswordManager
+AppSupportURL=https://github.com/cse23-039/PasswordManager/issues
+AppUpdatesURL=https://github.com/cse23-039/PasswordManager/releases
 AppCopyright=Copyright (C) 2024 {#AppPublisher}
 
 ; Installation directory
@@ -87,8 +87,8 @@ Name: "{commondesktop}\{#AppName}";     Filename: "{app}\{#AppExeName}"; Tasks: 
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGUID}_is1"; ValueType: string; ValueName: "DisplayName";     ValueData: "{#AppName} {#AppVersion}"; Flags: uninsdeletevalue
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGUID}_is1"; ValueType: string; ValueName: "Publisher";        ValueData: "{#AppPublisher}";          Flags: uninsdeletevalue
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGUID}_is1"; ValueType: string; ValueName: "DisplayVersion";    ValueData: "{#AppVersion}";            Flags: uninsdeletevalue
-Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGUID}_is1"; ValueType: string; ValueName: "HelpLink";          ValueData: "https://github.com/KagisoSetwaba/password-manager/issues"; Flags: uninsdeletevalue
-Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGUID}_is1"; ValueType: string; ValueName: "URLInfoAbout";      ValueData: "https://github.com/KagisoSetwaba/password-manager";        Flags: uninsdeletevalue
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGUID}_is1"; ValueType: string; ValueName: "HelpLink";          ValueData: "https://github.com/cse23-039/PasswordManager/issues"; Flags: uninsdeletevalue
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGUID}_is1"; ValueType: string; ValueName: "URLInfoAbout";      ValueData: "https://github.com/cse23-039/PasswordManager";        Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\{#AppExeName}"; \

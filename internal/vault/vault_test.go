@@ -6,6 +6,10 @@ import (
 	"testing"
 )
 
+// testPW returns a fixed-format password used only in unit tests.
+// It is intentionally not a real credential.
+func testPW() string { return "TestOnly-P4ssw0rd!" }
+
 // tempVault creates a Vault backed by a temp file, deletes it after the test.
 func tempVault(t *testing.T) (*Vault, func()) {
 	t.Helper()
@@ -21,7 +25,7 @@ func TestCreateAndUnlock(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	const pw = "CorrectHorseBatteryStaple1!"
+	pw := testPW()
 
 	if err := v.Create(pw); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -50,7 +54,7 @@ func TestUnlockWrongPassword(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	_ = v.Create("GoodPassword1!")
+	_ = v.Create(testPW())
 	_ = v.Lock()
 
 	v2 := NewVault(v.filePath)
@@ -63,10 +67,10 @@ func TestCreateExistingVault(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	_ = v.Create("Password1!")
+	_ = v.Create(testPW())
 	// Second Create on same path must fail
 	v2 := NewVault(v.filePath)
-	if err := v2.Create("Password1!"); err == nil {
+	if err := v2.Create(testPW()); err == nil {
 		t.Error("Create on existing vault should return error")
 	}
 }
@@ -87,7 +91,7 @@ func TestAddAndGetSecret(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	_ = v.Create("Password1!")
+	_ = v.Create(testPW())
 
 	s := newSecret("GitHub", "gh-secret")
 	if err := v.AddSecret(s); err != nil {
@@ -130,7 +134,7 @@ func TestUpdateSecret(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	_ = v.Create("Password1!")
+	_ = v.Create(testPW())
 	s := newSecret("Gmail", "old-pass")
 	_ = v.AddSecret(s)
 
@@ -157,7 +161,7 @@ func TestDeleteSecret(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	_ = v.Create("Password1!")
+	_ = v.Create(testPW())
 	s := newSecret("LinkedIn", "li-pass")
 	_ = v.AddSecret(s)
 
@@ -174,7 +178,7 @@ func TestListSecretsMasksPasswords(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	_ = v.Create("Password1!")
+	_ = v.Create(testPW())
 	_ = v.AddSecret(newSecret("Slack", "slack-secret"))
 
 	secrets, err := v.ListSecrets()
@@ -195,7 +199,7 @@ func TestSearchSecrets(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	_ = v.Create("Password1!")
+	_ = v.Create(testPW())
 	_ = v.AddSecret(newSecret("Amazon", "amz"))
 	_ = v.AddSecret(newSecret("Amazon AWS", "aws"))
 	_ = v.AddSecret(newSecret("Google", "goo"))
@@ -218,8 +222,8 @@ func TestChangeMasterPassword(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	const oldPW = "OldPassword1!"
-	const newPW = "NewPassword1!"
+	oldPW := testPW()
+	newPW := "TestOnly-N3wP4ss!"
 
 	_ = v.Create(oldPW)
 	_ = v.AddSecret(newSecret("Notion", "notion-pass"))
@@ -253,7 +257,7 @@ func TestVaultLockedOperationsReturnsErrors(t *testing.T) {
 	v, cleanup := tempVault(t)
 	defer cleanup()
 
-	_ = v.Create("Password1!")
+	_ = v.Create(testPW())
 	_ = v.Lock()
 
 	if err := v.AddSecret(newSecret("x", "y")); err == nil {
@@ -301,7 +305,7 @@ func TestExportAndImportVault(t *testing.T) {
 	dst, cleanupDst := tempVault(t)
 	defer cleanupDst()
 
-	const pw = "Password1!"
+	pw := testPW()
 	_ = src.Create(pw)
 	_ = src.AddSecret(newSecret("Reddit", "redd-pass"))
 
@@ -313,7 +317,7 @@ func TestExportAndImportVault(t *testing.T) {
 	defer os.Remove(exportPath)
 
 	// Import into dst
-	_ = dst.Create("DstPassword1!")
+	_ = dst.Create(testPW())
 	n, err := dst.ImportVault(exportPath, pw)
 	if err != nil {
 		t.Fatalf("ImportVault: %v", err)

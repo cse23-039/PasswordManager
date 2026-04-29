@@ -27,7 +27,7 @@ func NewResetPasswordForm(onReset func(username, currentPwd, newPwd string)) *Re
 		CurrentPwdEntry: widget.NewPasswordEntry(),
 		NewPwdEntry:     widget.NewPasswordEntry(),
 		ConfirmPwdEntry: widget.NewPasswordEntry(),
-		ErrorLabel:      widget.NewLabelWithStyle("", fyne.TextAlignCenter, fyne.TextStyle{}),
+		ErrorLabel:      makeErrorLabel(),
 		SuccessLabel:    widget.NewLabelWithStyle("", fyne.TextAlignCenter, fyne.TextStyle{}),
 		OnReset:         onReset,
 	}
@@ -36,7 +36,6 @@ func NewResetPasswordForm(onReset func(username, currentPwd, newPwd string)) *Re
 	form.CurrentPwdEntry.SetPlaceHolder("Current Password")
 	form.NewPwdEntry.SetPlaceHolder("New Password (min 12 chars)")
 	form.ConfirmPwdEntry.SetPlaceHolder("Confirm New Password")
-	form.ErrorLabel.Importance = widget.DangerImportance
 	form.SuccessLabel.Importance = widget.SuccessImportance
 
 	return form
@@ -45,19 +44,15 @@ func NewResetPasswordForm(onReset func(username, currentPwd, newPwd string)) *Re
 // GetContainer returns the password reset form as a container
 func (rpf *ResetPasswordForm) GetContainer() *fyne.Container {
 	return container.NewVBox(
-		widget.NewLabelWithStyle("Reset Password", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		widget.NewSeparator(),
-		widget.NewLabel("Username:"),
-		rpf.UsernameEntry,
-		widget.NewLabel("Current Password:"),
-		rpf.CurrentPwdEntry,
-		widget.NewLabel("New Password:"),
-		rpf.NewPwdEntry,
-		widget.NewLabel("Confirm New Password:"),
-		rpf.ConfirmPwdEntry,
+		makeCenteredHeading("Reset Password"),
+		makeDivider(),
+		makeFormRow("Username:", makeFullWidthEntry(rpf.UsernameEntry)),
+		makeFormRow("Current Password:", makeFullWidthEntry(rpf.CurrentPwdEntry)),
+		makeFormRow("New Password:", makeFullWidthEntry(rpf.NewPwdEntry)),
+		makeFormRow("Confirm New Password:", makeFullWidthEntry(rpf.ConfirmPwdEntry)),
 		rpf.ErrorLabel,
 		rpf.SuccessLabel,
-		widget.NewButtonWithIcon("Reset Password", theme.ViewRefreshIcon(), func() {
+		makePrimaryBtn("Reset Password", theme.ViewRefreshIcon(), func() {
 			username := strings.TrimSpace(rpf.UsernameEntry.Text)
 			currentPwd := rpf.CurrentPwdEntry.Text
 			newPwd := rpf.NewPwdEntry.Text
@@ -73,6 +68,11 @@ func (rpf *ResetPasswordForm) GetContainer() *fyne.Container {
 
 			if len(newPwd) < 12 {
 				rpf.ErrorLabel.SetText("New password must be at least 12 characters")
+				return
+			}
+
+			if msg := passwordComplexityError(newPwd); msg != "" {
+				rpf.ErrorLabel.SetText(msg)
 				return
 			}
 

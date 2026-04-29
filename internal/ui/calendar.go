@@ -121,8 +121,12 @@ func showCalendarDialog(title string, initial time.Time, win fyne.Window, onPick
 	applyBtn := widget.NewButton("Apply", func() {
 		h := 0
 		m := 0
-		fmt.Sscanf(hourSel.Selected, "%d", &h)
-		fmt.Sscanf(minSel.Selected, "%d", &m)
+		if n, _ := fmt.Sscanf(hourSel.Selected, "%d", &h); n != 1 {
+			h = 0 // fallback to midnight on parse failure
+		}
+		if n, _ := fmt.Sscanf(minSel.Selected, "%d", &m); n != 1 {
+			m = 0
+		}
 		picked := time.Date(cur.Year(), cur.Month(), selectedDay, h, m, 0, 0, time.UTC)
 		onPick(picked)
 		dlg.Hide()

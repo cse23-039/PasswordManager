@@ -56,25 +56,38 @@ func GetAuthConfig() *AuthConfig {
 	}
 }
 
-// UpdateConfig updates configuration values (for admin use)
+// clampInt returns val clamped to [min, max].
+func clampInt(val, min, max int) int {
+	if val < min {
+		return min
+	}
+	if val > max {
+		return max
+	}
+	return val
+}
+
+// UpdateConfig updates configuration values (for admin use).
+// All integer fields are clamped to safe ranges to prevent misconfiguration.
 func (cfg *AuthConfig) UpdateConfig(updates map[string]interface{}) {
 	if v, ok := updates["password_min_length"]; ok {
 		if val, ok := v.(int); ok {
-			cfg.PasswordMinLength = val
+			cfg.PasswordMinLength = clampInt(val, 8, 128)
 		}
 	}
 	if v, ok := updates["max_failed_attempts"]; ok {
 		if val, ok := v.(int); ok {
-			cfg.MaxFailedAttempts = val
+			cfg.MaxFailedAttempts = clampInt(val, 1, 20)
 		}
 	}
 	if v, ok := updates["session_timeout_mins"]; ok {
 		if val, ok := v.(int); ok {
-			cfg.SessionTimeoutMins = val
+			cfg.SessionTimeoutMins = clampInt(val, 5, 1440)
 		}
 	}
 	if v, ok := updates["lockout_duration_mins"]; ok {
 		if val, ok := v.(int); ok {
+			val = clampInt(val, 1, 1440)
 			cfg.LockoutDurationMins = val
 			cfg.LockoutDuration = time.Duration(val) * time.Minute
 		}

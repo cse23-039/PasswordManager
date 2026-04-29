@@ -175,7 +175,7 @@ func (l *handleOverlayLayout) MinSize(_ []fyne.CanvasObject) fyne.Size {
 func buildResizableHeader(cols []string, cw *colWidths) (hdrRow *fyne.Container, hdrCellCount int) {
 	cells := make([]fyne.CanvasObject, len(cols))
 	for i, col := range cols {
-		cells[i] = bold(col)
+		cells[i] = makeHeading(col)
 	}
 	return buildResizableHeaderCustom(cells, cw)
 }

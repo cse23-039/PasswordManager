@@ -415,25 +415,10 @@ func (v *VaultWithUser) resetSessionCounts() {
 	}
 }
 
-func (v *VaultWithUser) decrementActiveSessionCount(username string) {
-	username = strings.TrimSpace(username)
-	if username == "" {
-		return
-	}
-	uf, err := v.readUsersFile()
-	if err != nil {
-		return
-	}
-	key, rec, ok := resolveUsername(uf, username)
-	if !ok || rec.ActiveSessionCount <= 0 {
-		return
-	}
-	rec.ActiveSessionCount--
-	uf.Users[key] = rec
-	_ = v.writeUsersFile(uf)
-}
-
-func (v *VaultWithUser) incrementActiveSessionCount(username string) {
+// modifySessionCount adds delta to the named user's ActiveSessionCount in a
+// single read+write cycle. Positive delta increments, negative decrements.
+// The count is clamped to [0, ∞) to prevent underflow from stale counters.
+func (v *VaultWithUser) modifySessionCount(username string, delta int) {
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return
@@ -446,9 +431,20 @@ func (v *VaultWithUser) incrementActiveSessionCount(username string) {
 	if !ok {
 		return
 	}
-	rec.ActiveSessionCount++
+	rec.ActiveSessionCount += delta
+	if rec.ActiveSessionCount < 0 {
+		rec.ActiveSessionCount = 0
+	}
 	uf.Users[key] = rec
 	_ = v.writeUsersFile(uf)
+}
+
+func (v *VaultWithUser) decrementActiveSessionCount(username string) {
+	v.modifySessionCount(username, -1)
+}
+
+func (v *VaultWithUser) incrementActiveSessionCount(username string) {
+	v.modifySessionCount(username, 1)
 }
 
 // UsersFileExists reports whether the companion users file exists.
@@ -970,20 +966,24 @@ func (v *VaultWithUser) ChangeUserRole(targetUsername, newRole, byUsername strin
 	if err != nil {
 		return err
 	}
-	rec, ok := uf.Users[targetUsername]
+	// Use resolveUsername for case-insensitive lookup so "Alice" and "alice"
+	// are treated as the same account, preventing ghost-role divergence.
+	key, rec, ok := resolveUsername(uf, targetUsername)
 	if !ok {
 		return fmt.Errorf("user '%s' not found", targetUsername)
 	}
 	oldRole := rec.Role
 	rec.Role = newRole
-	uf.Users[targetUsername] = rec
+	uf.Users[key] = rec
 	if err := v.writeUsersFile(uf); err != nil {
 		return err
 	}
-	if v.userProfile != nil && strings.EqualFold(targetUsername, v.userProfile.Username) {
+	if v.userProfile != nil && strings.EqualFold(key, v.userProfile.Username) {
 		v.userProfile.Role = newRole
 	}
-	v.auditLog.LogAdminChange(byUsername, "ROLE_CHANGE", targetUsername,
+	// Invalidate cached role so the next GetRole re-reads the updated value.
+	v.invalidateCachedRole()
+	v.auditLog.LogAdminChange(byUsername, "ROLE_CHANGE", key,
 		fmt.Sprintf("%s -> %s", oldRole, newRole))
 	return nil
 }
@@ -998,16 +998,16 @@ func (v *VaultWithUser) RevokeUserRecord(targetUsername, byUsername string) erro
 	if err != nil {
 		return err
 	}
-	rec, ok := uf.Users[targetUsername]
+	key, rec, ok := resolveUsername(uf, targetUsername)
 	if !ok {
 		return fmt.Errorf("user '%s' not found", targetUsername)
 	}
 	rec.IsRevoked = true
-	uf.Users[targetUsername] = rec
+	uf.Users[key] = rec
 	if err := v.writeUsersFile(uf); err != nil {
 		return err
 	}
-	v.auditLog.LogAdminChange(byUsername, "USER_REVOKE", targetUsername, "access revoked")
+	v.auditLog.LogAdminChange(byUsername, "USER_REVOKE", key, "access revoked")
 	return nil
 }
 
@@ -1108,13 +1108,21 @@ func (v *VaultWithUser) DeleteUserRecord(targetUsername, byUsername string) erro
 	if err != nil {
 		return err
 	}
-	if _, ok := uf.Users[targetUsername]; !ok {
+	key, _, ok := resolveUsername(uf, targetUsername)
+	if !ok {
 		return fmt.Errorf("user '%s' not found", targetUsername)
 	}
-	delete(uf.Users, targetUsername)
+	delete(uf.Users, key)
 	if err := v.writeUsersFile(uf); err != nil {
 		return err
 	}
-	v.auditLog.LogAdminChange(byUsername, "USER_DELETE", targetUsername, "user deleted")
+
+	// Remove the per-user TOTP mutex to prevent the map from growing unboundedly.
+	lockKey := strings.ToLower(strings.TrimSpace(key))
+	v.totpLocksMu.Lock()
+	delete(v.totpLocks, lockKey)
+	v.totpLocksMu.Unlock()
+
+	v.auditLog.LogAdminChange(byUsername, "USER_DELETE", key, "user deleted")
 	return nil
 }

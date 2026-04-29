@@ -96,68 +96,39 @@ Filename: "{app}\{#AppExeName}"; \
   Flags: nowait postinstall skipifsilent runascurrentuser
 
 [UninstallDelete]
-; Vault data is controlled by the optional checkbox in the uninstaller (see [Code] section below).
-; Automatic silent deletion is intentionally disabled — the checkbox gives the user explicit control.
+; Force-remove the entire install directory (catches any runtime-created files the installer didn't track).
+Type: filesandordirs; Name: "{app}"
 
 [Code]
 
 // ---------------------------------------------------------------------------
-// Uninstaller — optional vault data deletion checkbox
+// Uninstaller — ask about vault data BEFORE uninstall begins
 // ---------------------------------------------------------------------------
 var
-  DeleteDataCheckBox: TNewCheckBox;
-  DeleteDataWarning:  TNewStaticText;
+  DeleteVaultData: Boolean;
 
-procedure InitializeUninstallProgressForm();
+function InitializeUninstall(): Boolean;
 var
-  Sep:         TBevel;
-  OptLabel:    TNewStaticText;
-  InnerPage:   TNewNotebookPage;
-  BaseTop:     Integer;
+  Res: Integer;
 begin
-  InnerPage := UninstallProgressForm.InnerPage;
-  BaseTop   := UninstallProgressForm.ProgressBar.Top +
-               UninstallProgressForm.ProgressBar.Height + 16;
+  Result := True;
+  DeleteVaultData := False;
 
-  // Separator line
-  Sep        := TBevel.Create(UninstallProgressForm);
-  Sep.Parent := InnerPage;
-  Sep.Left   := 0;
-  Sep.Top    := BaseTop;
-  Sep.Width  := InnerPage.Width;
-  Sep.Height := 2;
-  Sep.Shape  := bsTopLine;
+  Res := MsgBox(
+    'Uninstall Password Manager?' + #13#10#13#10 +
+    'Your vault data (passwords, accounts, audit logs) is stored in:' + #13#10 +
+    '  %AppData%\PasswordManager' + #13#10#13#10 +
+    'YES    — Uninstall and permanently delete all vault data.' + #13#10 +
+    'NO     — Uninstall but keep your vault data.' + #13#10 +
+    'CANCEL — Abort uninstall.',
+    mbConfirmation,
+    MB_YESNOCANCEL or MB_DEFBUTTON2
+  );
 
-  // "Optional" heading
-  OptLabel            := TNewStaticText.Create(UninstallProgressForm);
-  OptLabel.Parent     := InnerPage;
-  OptLabel.Left       := 0;
-  OptLabel.Top        := Sep.Top + Sep.Height + 8;
-  OptLabel.Width      := InnerPage.Width;
-  OptLabel.Caption    := 'Optional:';
-  OptLabel.Font.Style := [fsBold];
-
-  // Delete data checkbox
-  DeleteDataCheckBox         := TNewCheckBox.Create(UninstallProgressForm);
-  DeleteDataCheckBox.Parent  := InnerPage;
-  DeleteDataCheckBox.Left    := 0;
-  DeleteDataCheckBox.Top     := OptLabel.Top + OptLabel.Height + 4;
-  DeleteDataCheckBox.Width   := InnerPage.Width;
-  DeleteDataCheckBox.Caption :=
-    'Delete all vault data from AppData\PasswordManager' +
-    ' (passwords, user accounts and audit logs will be permanently removed)';
-  DeleteDataCheckBox.Checked := False;
-
-  // Warning text shown beneath checkbox
-  DeleteDataWarning            := TNewStaticText.Create(UninstallProgressForm);
-  DeleteDataWarning.Parent     := InnerPage;
-  DeleteDataWarning.Left       := 16;
-  DeleteDataWarning.Top        := DeleteDataCheckBox.Top + DeleteDataCheckBox.Height + 4;
-  DeleteDataWarning.Width      := InnerPage.Width - 16;
-  DeleteDataWarning.Caption    :=
-    'Warning: this action is irreversible. Leave unchecked to keep your data.';
-  DeleteDataWarning.Font.Color := $0000CC;   // dark red (BGR)
-  DeleteDataWarning.Font.Style := [fsItalic];
+  if Res = IDCANCEL then
+    Result := False
+  else if Res = IDYES then
+    DeleteVaultData := True;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -166,7 +137,7 @@ var
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    if Assigned(DeleteDataCheckBox) and DeleteDataCheckBox.Checked then
+    if DeleteVaultData then
     begin
       DataPath := ExpandConstant('{userappdata}\PasswordManager');
       if DirExists(DataPath) then

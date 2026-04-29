@@ -11,18 +11,19 @@ import (
 	"sync"
 	"time"
 
-	"runtime/debug"
-
 	"golang.org/x/crypto/argon2"
 
 	"password-manager/internal/auth"
 	"password-manager/internal/models"
 )
 
-// Sentinel login errors – used by the UI to show specific messages.
+// Sentinel login errors. ErrUserNotFound and ErrInvalidPassword intentionally
+// carry the same user-facing message to prevent username enumeration; callers
+// should display them identically. The distinct types still allow internal
+// routing (e.g. audit logging, lockout handling) without leaking the reason.
 var (
-	ErrUserNotFound    = errors.New("user does not exist")
-	ErrInvalidPassword = errors.New("invalid password")
+	ErrUserNotFound    = errors.New("invalid credentials")
+	ErrInvalidPassword = errors.New("invalid credentials")
 	ErrPasswordExpired = errors.New("password expired")
 )
 
@@ -60,6 +61,11 @@ type VaultWithUser struct {
 	// per-user locks to protect TOTP counter updates and related user-record mutations
 	totpLocks   map[string]*sync.Mutex
 	totpLocksMu sync.Mutex
+	// cachedRole is the role resolved from the users file at login time.
+	// It is refreshed only when an admin explicitly changes a role, avoiding
+	// a file read+decrypt on every permission check.
+	cachedRoleMu sync.RWMutex
+	cachedRole   string
 }
 
 // NewVaultWithUser creates a vault with user management
@@ -97,25 +103,50 @@ func NewVaultWithUser(filePath string) *VaultWithUser {
 }
 
 // GetRole returns the role of the currently logged-in user.
+// The role is resolved from the users file once at login and cached;
+// subsequent calls return the cached value without disk I/O.
 // Returns RoleAdministrator for legacy profiles that pre-date role assignment.
 func (v *VaultWithUser) GetRole() string {
 	if v.userProfile == nil {
 		return ""
 	}
+	v.cachedRoleMu.RLock()
+	if v.cachedRole != "" {
+		r := v.cachedRole
+		v.cachedRoleMu.RUnlock()
+		return r
+	}
+	v.cachedRoleMu.RUnlock()
+
+	// Cache miss: resolve from users file once and populate the cache.
+	v.cachedRoleMu.Lock()
+	defer v.cachedRoleMu.Unlock()
+	// Double-check after acquiring write lock.
+	if v.cachedRole != "" {
+		return v.cachedRole
+	}
 	if uf, err := v.readUsersFile(); err == nil {
 		if _, rec, ok := resolveUsername(uf, v.userProfile.Username); ok && rec != nil && rec.Role != "" {
-			if v.userProfile.Role != rec.Role {
-				v.userProfile.Role = rec.Role
-			}
-			// ensure in-memory username matches stored canonical entry
+			v.userProfile.Role = rec.Role
 			v.userProfile.Username = rec.Username
+			v.cachedRole = rec.Role
 			return rec.Role
 		}
 	}
-	if v.userProfile.Role == "" {
-		return models.RoleAdministrator // backward-compat: single-user vault owner is admin
+	role := v.userProfile.Role
+	if role == "" {
+		role = models.RoleAdministrator // backward-compat: single-user vault owner is admin
 	}
-	return v.userProfile.Role
+	v.cachedRole = role
+	return role
+}
+
+// invalidateCachedRole clears the in-memory role cache so the next GetRole
+// call re-reads from the users file. Call this after any role change.
+func (v *VaultWithUser) invalidateCachedRole() {
+	v.cachedRoleMu.Lock()
+	v.cachedRole = ""
+	v.cachedRoleMu.Unlock()
 }
 
 // ── Audit log accessors + exports (for admin dashboard) ────────────────────
@@ -165,6 +196,48 @@ func (v *VaultWithUser) GetStatsByUser() (map[string]interface{}, error) {
 	baseStats["my_entries"] = my
 	baseStats["current_user"] = currentUser
 	return baseStats, nil
+}
+
+// GetHealthReport returns the vault health report including security integrity indicators.
+// Any authenticated user can view the health of secrets they can read.
+func (v *VaultWithUser) GetHealthReport() (*VaultHealthReport, error) {
+	if v.userProfile == nil {
+		return nil, fmt.Errorf("authentication required")
+	}
+	// Administrators and Security Officers see all secrets (for oversight).
+	// All other roles see only the secrets they own — scanning the full vault
+	// would leak the existence and count of secrets belonging to other users.
+	ownerFilter := ""
+	if !v.HasPermission(auth.CanViewAuditLogs) {
+		ownerFilter = strings.TrimSpace(v.userProfile.Username)
+	}
+	report, err := v.Vault.computeHealthReport(ownerFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	// Tamper detection and audit integrity are sensitive — restrict to roles that
+	// already have visibility into audit logs (SecurityOfficer, Administrator).
+	if v.HasPermission(auth.CanViewAuditLogs) {
+		report.VaultFileTampered = v.Vault.CheckExternalModification()
+		report.AuditChainIntact = v.auditLog.VerifyChainIntegrity()
+		report.AuditVerified, report.AuditTampered, report.AuditUnverifiable = v.auditLog.VerifyAllIntegrity()
+	} else {
+		// Mark chain as intact so the issue counter does not falsely flag standard users.
+		report.AuditChainIntact = true
+	}
+
+	// MFA status for the currently authenticated user.
+	report.MFAEnabled = v.userProfile.MFAEnabled && v.userProfile.TOTPVerified
+
+	// Security policy presence and key settings.
+	if policy, pErr := v.GetSecurityPolicy(); pErr == nil && policy != nil {
+		report.HasSecurityPolicy = true
+		report.MFARequired = policy.MFARequired
+		report.PasswordExpiryDays = policy.PasswordExpiryDays
+	}
+
+	return report, nil
 }
 
 // GetAuditStats returns summary statistics about the audit log.
@@ -356,10 +429,11 @@ func (v *VaultWithUser) finalizeLogin(username, ipAddress string) error {
 	}
 	v.RecordLoginAttempt(true)
 	v.auditLog.LogLogin(username, true, "", ipAddress)
-	// Apply any persisted RBAC permission overrides so the runtime map is in sync
+	// Apply any persisted RBAC permission overrides so the runtime map is in sync.
 	v.ApplyStoredRolePermissions()
-	// Argon2 key derivation allocates ~64 MB; release it back to the OS immediately.
-	debug.FreeOSMemory()
+	// Seed the role cache immediately so first permission check has no file I/O.
+	v.invalidateCachedRole()
+	_ = v.GetRole()
 	return nil
 }
 
@@ -576,6 +650,7 @@ func (v *VaultWithUser) Logout() error {
 		v.auditLog.LogAdminChange(username, "LOGOUT", "session", "user logged out")
 	}
 	v.userProfile = nil
+	v.invalidateCachedRole()
 	v.pendingMu.Lock()
 	v.pendingMFASecret = ""
 	v.pendingMu.Unlock()
@@ -1036,6 +1111,7 @@ func (v *VaultWithUser) GetUserProfile() (*UserProfile, error) {
 	return &UserProfile{
 		Username:         v.userProfile.Username,
 		Email:            v.userProfile.Email,
+		Role:             v.userProfile.Role,
 		MFAEnabled:       v.userProfile.MFAEnabled,
 		TOTPVerified:     v.userProfile.TOTPVerified,
 		CreatedAt:        v.userProfile.CreatedAt,
@@ -1251,11 +1327,15 @@ func (v *VaultWithUser) saveUserProfile() error {
 	}
 
 	// Serialize safe view
+	safeJSON, err := marshalJSON(safe)
+	if err != nil {
+		return fmt.Errorf("failed to serialize user profile: %w", err)
+	}
 	profileData := &SecretData{
 		ID:       UserProfileSecretID,
 		Name:     "__USER_PROFILE__",
 		Category: "__SYSTEM__",
-		Notes:    string(mustMarshalJSON(safe)),
+		Notes:    string(safeJSON),
 	}
 
 	if _, err := v.Vault.getSecret(UserProfileSecretID); err == nil {
@@ -1356,8 +1436,16 @@ func hashUserPassword(password string, salt []byte) []byte {
 	)
 }
 
-// validatePasswordStrength checks password complexity
+// validatePasswordStrength is the single authoritative password validator.
+// It enforces the absolute minimum (12 chars, all four character classes).
+// Callers that have a live security policy should call ValidatePasswordAgainstVaultPolicy
+// instead, which delegates here after applying any stricter configured limits.
 func validatePasswordStrength(password string) error {
+	const absoluteMinLen = 12
+	if len(password) < absoluteMinLen {
+		return fmt.Errorf("password must be at least %d characters long", absoluteMinLen)
+	}
+
 	hasUpper := false
 	hasLower := false
 	hasDigit := false
@@ -1439,8 +1527,17 @@ func (v *VaultWithUser) validateTOTPForUser(username, secret, code string) bool 
 			continue
 		}
 
-		// Check replay: must be greater than stored counter (skip first use when last==0)
-		if last > 0 && candidate <= last {
+		// Replay protection: the accepted counter must strictly exceed the last used
+		// one. On first use (last==0) we still enforce this — initialise last to
+		// counterNow-skew-1 so that only the current window is accepted, preventing
+		// an intercepted code from being reused within the 90-second skew window.
+		baseline := last
+		if baseline == 0 {
+			if counterNow > uint64(cfg.Skew) {
+				baseline = counterNow - uint64(cfg.Skew) - 1
+			}
+		}
+		if candidate <= baseline {
 			return false
 		}
 
@@ -1469,13 +1566,9 @@ func secureCompare(a, b []byte) bool {
 	return result == 0
 }
 
-// mustMarshalJSON marshals to JSON (panics on error)
-func mustMarshalJSON(v interface{}) []byte {
-	data, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	return data
+// marshalJSON marshals v to JSON, returning an error instead of panicking.
+func marshalJSON(v interface{}) ([]byte, error) {
+	return json.Marshal(v)
 }
 
 // mustUnmarshalJSON unmarshals from JSON

@@ -1,4 +1,4 @@
-name: Build & Release
+name: Build, Test & Release
 
 on:
   push:
@@ -11,16 +11,16 @@ permissions:
   contents: write
 
 jobs:
-  # ─── Tests ───────────────────────────────────────────────────────────────────
-  test:
-    name: Test (Linux)
+  # ─── Security & quality checks ──────────────────────────────────────────────
+  lint:
+    name: Lint & Security Scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
 
       - name: Install Fyne system deps
         run: |
@@ -29,13 +29,43 @@ jobs:
             gcc libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
             libxi-dev libgl1-mesa-dev libxxf86vm-dev pkg-config
 
-      - run: go vet ./...
+      - name: go vet
+        run: go vet ./...
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+
+  # ─── Tests ──────────────────────────────────────────────────────────────────
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Install Fyne system deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+            libxi-dev libgl1-mesa-dev libxxf86vm-dev pkg-config
+
       - run: go test ./internal/... -v -count=1 -timeout 120s
 
-  # ─── Build matrix ────────────────────────────────────────────────────────────
+  # ─── Build matrix ───────────────────────────────────────────────────────────
   build:
     name: Build (${{ matrix.os }})
-    needs: test
+    needs: [lint, test]
     strategy:
       fail-fast: false
       matrix:
@@ -57,7 +87,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
 
       - name: Resolve version
         id: ver
@@ -93,7 +123,47 @@ jobs:
             -o "bin/${{ matrix.bin }}" \
             ./cmd/password-manager
 
-      # Windows only: compile the Inno Setup installer on release tags
+      # ── SBOM generation ──────────────────────────────────────────────────────
+      # Produces a CycloneDX SBOM alongside each binary so downstream consumers
+      # can audit the dependency tree without building from source.
+      - name: Generate SBOM
+        shell: bash
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+          cyclonedx-gomod app \
+            -main ./cmd/password-manager \
+            -output "bin/${{ matrix.bin }}.sbom.json" \
+            -json
+
+      # ── Minisign signing (release tags only) ─────────────────────────────────
+      # Signs each binary so the in-app updater can verify the download before
+      # applying it.  Requires MINISIGN_KEY and MINISIGN_PASSWORD repo secrets.
+      - name: Install minisign
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            choco install minisign --no-progress -y
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            brew install minisign
+          else
+            sudo apt-get install -y minisign
+          fi
+
+      - name: Sign binary
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          echo "$MINISIGN_KEY" > /tmp/release.key
+          printf '%s' "$MINISIGN_PASSWORD" | minisign -S -s /tmp/release.key \
+            -m "bin/${{ matrix.bin }}" \
+            -t "password-manager ${{ steps.ver.outputs.version }}"
+          rm /tmp/release.key
+
+      # ── Windows installer ─────────────────────────────────────────────────────
       - name: Build Windows installer
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -106,7 +176,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.bin }}
-          path: bin/${{ matrix.bin }}
+          path: |
+            bin/${{ matrix.bin }}
+            bin/${{ matrix.bin }}.minisig
+            bin/${{ matrix.bin }}.sbom.json
           retention-days: 7
 
       - name: Upload installer artifact (Windows release only)
@@ -117,7 +190,7 @@ jobs:
           path: installer\windows\Output\*.exe
           retention-days: 7
 
-  # ─── GitHub Release ───────────────────────────────────────────────────────────
+  # ─── GitHub Release ──────────────────────────────────────────────────────────
   release:
     name: Publish Release
     if: startsWith(github.ref, 'refs/tags/v')

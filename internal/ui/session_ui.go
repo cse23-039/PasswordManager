@@ -33,7 +33,7 @@ type SessionDisplayInfo struct {
 
 // GetSessionView creates the session management view
 func (sui *SessionUI) GetSessionView(sessions []SessionDisplayInfo, onInvalidate func(string), onInvalidateAll func()) *fyne.Container {
-	title := widget.NewLabelWithStyle("Active Sessions", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	title := makeCenteredHeading("Active Sessions")
 
 	if len(sessions) == 0 {
 		return container.NewVBox(
@@ -65,7 +65,11 @@ func (sui *SessionUI) GetSessionView(sessions []SessionDisplayInfo, onInvalidate
 			rows := obj.(*fyne.Container).Objects
 
 			row1 := rows[0].(*fyne.Container).Objects
-			row1[1].(*widget.Label).SetText(session.ID[:8] + "...")
+			idDisplay := session.ID
+			if len(idDisplay) > 16 {
+				idDisplay = idDisplay[:16] + "..."
+			}
+			row1[1].(*widget.Label).SetText(idDisplay)
 			row1[2].(*widget.Label).SetText(session.Username)
 
 			row2 := rows[1].(*fyne.Container).Objects
@@ -76,11 +80,11 @@ func (sui *SessionUI) GetSessionView(sessions []SessionDisplayInfo, onInvalidate
 
 	return container.NewVBox(
 		title,
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle(fmt.Sprintf("Active Sessions: %d", len(sessions)), fyne.TextAlignLeading, fyne.TextStyle{}),
+		makeDivider(),
+		widget.NewLabel(fmt.Sprintf("Active Sessions: %d", len(sessions))),
 		list,
-		widget.NewSeparator(),
-		widget.NewButtonWithIcon("Invalidate All Sessions", theme.DeleteIcon(), func() {
+		makeDivider(),
+		makeDangerBtn("Invalidate All Sessions", theme.DeleteIcon(), func() {
 			if onInvalidateAll != nil {
 				onInvalidateAll()
 			}

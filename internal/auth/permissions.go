@@ -34,6 +34,10 @@ const (
 	CanRestoreVault   = "restore_vault"
 	CanManageSessions = "manage_sessions"
 	CanManageRoles    = "manage_roles"
+
+	// Sharing permissions
+	CanShareSecret   = "share_secret"
+	CanUnshareSecret = "unshare_secret"
 )
 
 // RolePermissions maps roles to their allowed permissions
@@ -54,7 +58,7 @@ var RolePermissions = map[string][]string{
 	},
 	models.RoleStandardUser: {
 		CanViewSecrets, CanCreateSecret, CanEditSecret, CanDeleteSecret,
-		CanCopySecret,
+		CanCopySecret, CanShareSecret, CanUnshareSecret,
 	},
 	models.RoleReadOnly: {
 		CanViewSecrets, CanCopySecret,
@@ -64,10 +68,14 @@ var RolePermissions = map[string][]string{
 // rpMu protects RolePermissions for concurrent access
 var rpMu sync.RWMutex
 
-// CheckPermission checks if a user has a specific permission
+// CheckPermission checks if a user has a specific permission.
+// Administrators always pass — they have implicit access to everything.
 func CheckPermission(user *models.User, permission string) error {
 	if user == nil {
 		return fmt.Errorf("user is nil")
+	}
+	if user.Role == models.RoleAdministrator {
+		return nil
 	}
 
 	rpMu.RLock()
@@ -119,6 +127,7 @@ func GetAllRoles() []string {
 var AllPermissions = []string{
 	// Secrets
 	CanViewSecrets, CanCreateSecret, CanEditSecret, CanDeleteSecret, CanCopySecret, CanRotateSecret,
+	CanShareSecret, CanUnshareSecret,
 	// Users
 	CanViewUsers, CanCreateUser, CanDeleteUser, CanChangeRole, CanLockUser,
 	// Admin
@@ -135,6 +144,8 @@ var PermissionLabels = map[string]string{
 	CanDeleteSecret:   "Delete secrets",
 	CanCopySecret:     "Copy secret to clipboard",
 	CanRotateSecret:   "Rotate / regenerate secrets",
+	CanShareSecret:    "Share secrets with other users",
+	CanUnshareSecret:  "Revoke shared access to secrets",
 	CanViewUsers:      "View user list",
 	CanCreateUser:     "Create new users",
 	CanDeleteUser:     "Delete users",
@@ -155,7 +166,7 @@ var PermissionGroups = []struct {
 	Label       string
 	Permissions []string
 }{
-	{"Secrets", []string{CanViewSecrets, CanCreateSecret, CanEditSecret, CanDeleteSecret, CanCopySecret, CanRotateSecret}},
+	{"Secrets", []string{CanViewSecrets, CanCreateSecret, CanEditSecret, CanDeleteSecret, CanCopySecret, CanRotateSecret, CanShareSecret, CanUnshareSecret}},
 	{"Users", []string{CanViewUsers, CanCreateUser, CanDeleteUser, CanChangeRole, CanLockUser}},
 	{"Administration", []string{CanManagePolicy, CanManageRoles, CanViewAuditLogs, CanExportData, CanImportData, CanBackupVault, CanRestoreVault, CanManageSessions}},
 }
@@ -163,11 +174,15 @@ var PermissionGroups = []struct {
 // ApplyRolePermissions replaces the runtime RolePermissions map entries from the
 // provided overrides map. Only roles present in overrides are updated; other
 // roles keep their compile-time defaults. Call this after loading persisted
-// overrides from the vault.
+// overrides from the vault. The administrator role is intentionally excluded
+// from overrides — admins always have implicit full access via CheckPermission.
 func ApplyRolePermissions(overrides map[string][]string) {
 	rpMu.Lock()
 	defer rpMu.Unlock()
 	for role, perms := range overrides {
+		if role == models.RoleAdministrator {
+			continue // admin permissions are not overridable; they bypass all checks
+		}
 		cp := make([]string, len(perms))
 		copy(cp, perms)
 		RolePermissions[role] = cp

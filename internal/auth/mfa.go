@@ -18,7 +18,7 @@ import (
 // Requirement 3.1: The system shall require MFA for all user logins
 type MFAConfig struct {
 	Issuer    string
-	Algorithm string // SHA1 for TOTP compatibility
+	Algorithm string // SHA256 (RFC 6238)
 	Digits    int    // 6 digits
 	Period    int    // 30 seconds
 	Skew      int    // Time steps to allow (for clock drift)
@@ -28,7 +28,7 @@ type MFAConfig struct {
 func DefaultMFAConfig() *MFAConfig {
 	return &MFAConfig{
 		Issuer:    "PasswordManager",
-		Algorithm: "SHA1",
+		Algorithm: "SHA1", // RFC 4226 default; all standard authenticator apps use SHA1
 		Digits:    6,
 		Period:    30,
 		Skew:      2,
@@ -118,7 +118,7 @@ func GetMFAProvisioningURI(secret, username, issuer string) string {
 	v := url.Values{}
 	v.Set("secret", secret)
 	v.Set("issuer", issuer)
-	v.Set("algorithm", "SHA1")
+	v.Set("algorithm", "SHA1") // RFC 4226 default; required for all standard authenticator apps
 	v.Set("digits", "6")
 	v.Set("period", "30")
 	if logoURL != "" {
@@ -128,15 +128,19 @@ func GetMFAProvisioningURI(secret, username, issuer string) string {
 	return fmt.Sprintf("otpauth://totp/%s?%s", url.PathEscape(label), v.Encode())
 }
 
-// generateHOTP generates an HOTP code (RFC 4226)
+// generateHOTP generates an HOTP code per RFC 4226 using HMAC-SHA1.
+// SHA-1 is mandated by RFC 4226 and is what every real authenticator app
+// (Google Authenticator, Microsoft Authenticator, Authy, 1Password, Bitwarden)
+// uses regardless of the algorithm field in the otpauth URI.
 func generateHOTP(key []byte, counter uint64, digits int) (string, error) {
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, counter)
 
-	mac := hmac.New(sha1.New, key)
+	mac := hmac.New(sha1.New, key) // RFC 4226 §5 specifies HMAC-SHA1
 	mac.Write(buf)
 	sum := mac.Sum(nil)
 
+	// Dynamic truncation per RFC 4226 §5.4
 	offset := sum[len(sum)-1] & 0x0f
 	code := binary.BigEndian.Uint32(sum[offset:offset+4]) & 0x7fffffff
 

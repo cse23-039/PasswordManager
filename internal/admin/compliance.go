@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"password-manager/internal/auth"
 )
 
 // ComplianceReport represents a compliance status report
@@ -118,7 +120,22 @@ func checkEncryptionCompliance() ComplianceSection {
 		Requirement: "3.1 - local vault file storage",
 	})
 
-	section.Status = "PASS"
+	// Verify TOTP uses SHA256, not the deprecated SHA1
+	mfaCfg := auth.DefaultMFAConfig()
+	totpStatus := "PASS"
+	totpDetails := fmt.Sprintf("TOTP algorithm: %s (required: SHA256)", mfaCfg.Algorithm)
+	if mfaCfg.Algorithm != "SHA256" {
+		totpStatus = "FAIL"
+	}
+	section.Checks = append(section.Checks, ComplianceCheck{
+		ID:          "ENC-004",
+		Name:        "TOTP HMAC Algorithm",
+		Status:      totpStatus,
+		Details:     totpDetails,
+		Requirement: "3.3 - strong HMAC for TOTP",
+	})
+
+	section.Status = sectionStatus(section.Checks)
 	return section
 }
 
@@ -173,25 +190,53 @@ func checkPasswordCompliance(pe *PolicyEnforcer) ComplianceSection {
 	return section
 }
 
-func checkSessionCompliance(_ *SessionManager) ComplianceSection {
+func checkSessionCompliance(sm *SessionManager) ComplianceSection {
 	section := ComplianceSection{
 		Name:        "Session Management (Req 3.6)",
 		Description: "Session timeout and controls",
 	}
 
+	// Check idle timeout is within a reasonable range (≤ 30 minutes)
+	idleStatus := "PASS"
+	idleDetails := "Session manager not available"
+	if sm != nil {
+		sm.mu.RLock()
+		idle := sm.maxIdleTime
+		sm.mu.RUnlock()
+		idleDetails = fmt.Sprintf("Idle timeout: %v (required: ≤30m)", idle.Round(time.Minute))
+		if idle > 30*time.Minute {
+			idleStatus = "FAIL"
+		}
+	} else {
+		idleStatus = "WARN"
+	}
 	section.Checks = append(section.Checks, ComplianceCheck{
 		ID:          "SESS-001",
-		Name:        "Session Timeout Configuration",
-		Status:      "PASS",
-		Details:     "Session timeout is configured",
+		Name:        "Session Idle Timeout",
+		Status:      idleStatus,
+		Details:     idleDetails,
 		Requirement: "3.6 - session timeout after inactivity",
 	})
 
+	// Check max session duration is configured (≤ 24 hours)
+	maxStatus := "PASS"
+	maxDetails := "Session manager not available"
+	if sm != nil {
+		sm.mu.RLock()
+		maxSess := sm.maxSessionTime
+		sm.mu.RUnlock()
+		maxDetails = fmt.Sprintf("Max session: %v (required: ≤24h)", maxSess.Round(time.Minute))
+		if maxSess > 24*time.Hour {
+			maxStatus = "FAIL"
+		}
+	} else {
+		maxStatus = "WARN"
+	}
 	section.Checks = append(section.Checks, ComplianceCheck{
 		ID:          "SESS-002",
-		Name:        "Session Invalidation",
-		Status:      "PASS",
-		Details:     "Sessions can be invalidated on demand",
+		Name:        "Maximum Session Duration",
+		Status:      maxStatus,
+		Details:     maxDetails,
 		Requirement: "3.6 - session invalidation support",
 	})
 

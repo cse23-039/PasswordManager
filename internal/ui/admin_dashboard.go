@@ -21,24 +21,6 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// boundedScroll wraps content in a VScroll whose MinSize height is 1 px.
-// Without this, VScroll reports its full content height as MinSize, which causes
-// AppTabs to grow the window every time more rows are added.
-func boundedScroll(content fyne.CanvasObject) *container.Scroll {
-	s := container.NewVScroll(content)
-	s.SetMinSize(fyne.NewSize(0, 1))
-	return s
-}
-
-// boundedTabContent wraps a tab's root widget in a bidirectional scroll with
-// min-size (1,1). This prevents wide GridWithColumns headers from locking the
-// window's minimum width and stops the window from becoming un-resizable.
-func boundedTabContent(content fyne.CanvasObject) fyne.CanvasObject {
-	s := container.NewScroll(content)
-	s.SetMinSize(fyne.NewSize(1, 1))
-	return s
-}
-
 // showAdminDashboard renders the admin panel.
 // Administrators see all 6 tabs; Security Officers see Audit Log and Security Policy only.
 func (ui *LocalVaultUI) showAdminDashboard() {
@@ -92,15 +74,13 @@ func (ui *LocalVaultUI) showAdminDashboard() {
 		return
 	}
 
-	backBtn := widget.NewButtonWithIcon("Back to Secrets", theme.NavigateBackIcon(), func() {
+	backBtn := makeLowBtn("Back to Secrets", theme.NavigateBackIcon(), func() {
 		ui.showSecretsList()
 	})
-	backBtn.Importance = widget.LowImportance
-
-	dashHeader := widget.NewCard(
+	dashHeader := makePageHeader(
 		"Admin Dashboard",
 		"Manage users, audit logs, sessions, and security policy.",
-		container.NewHBox(layout.NewSpacer(), backBtn),
+		backBtn,
 	)
 
 	tabs := container.NewAppTabs(tabItems...)
@@ -120,17 +100,12 @@ func (ui *LocalVaultUI) buildUsersTab() fyne.CanvasObject {
 		return widget.NewLabel(fmt.Sprintf("Error loading users: %v", err))
 	}
 
-	header := widget.NewLabelWithStyle(
-		fmt.Sprintf("Registered Users — %d total", len(records)),
-		fyne.TextAlignLeading, fyne.TextStyle{Bold: true},
-	)
+	header := makeHeading(fmt.Sprintf("Registered Users — %d total", len(records)))
 
-	createUserBtn := widget.NewButtonWithIcon("Create User", theme.ContentAddIcon(), func() {
+	createUserBtn := makePrimaryBtn("Create User", theme.ContentAddIcon(), func() {
 		ui.showCreateUserDialog()
 	})
-	createUserBtn.Importance = widget.HighImportance
-
-	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), func() {
+	refreshBtn := makeLowBtn("Refresh", theme.ViewRefreshIcon(), func() {
 		ui.showAdminDashboard()
 	})
 
@@ -166,7 +141,7 @@ func (ui *LocalVaultUI) buildUsersTab() fyne.CanvasObject {
 	for i, b := range userSortBtns {
 		headerCells[i] = b
 	}
-	headerCells[len(userSortBtns)] = bold("Actions")
+	headerCells[len(userSortBtns)] = makeHeading("Actions")
 	colHeader, _ := buildResizableHeaderCustom(headerCells, userCW)
 
 	var displayUsers []*vault.UserRecord
@@ -205,7 +180,7 @@ func (ui *LocalVaultUI) buildUsersTab() fyne.CanvasObject {
 			}
 			lastLogin := "Never"
 			if !r.LastLogin.IsZero() {
-				lastLogin = r.LastLogin.Format("2006-01-02 15:04")
+				lastLogin = r.LastLogin.Local().Format("2006-01-02 15:04")
 			}
 			c := obj.(*fyne.Container)
 			c.Objects[0].(*widget.Label).SetText(r.Username)
@@ -318,10 +293,8 @@ func (ui *LocalVaultUI) showUserManageDialog(rec *vault.UserRecord) {
 	roleSelect := widget.NewSelect(allRoles, nil)
 	roleSelect.Selected = rec.Role
 
-	revokeBtn := widget.NewButtonWithIcon("Revoke Access", theme.CancelIcon(), nil)
-	revokeBtn.Importance = widget.DangerImportance
-	deleteBtn := widget.NewButtonWithIcon("Delete User", theme.DeleteIcon(), nil)
-	deleteBtn.Importance = widget.DangerImportance
+	revokeBtn := makeDangerBtn("Revoke Access", theme.CancelIcon(), nil)
+	deleteBtn := makeDangerBtn("Delete User", theme.DeleteIcon(), nil)
 
 	if rec.IsRevoked {
 		revokeBtn.SetText("Already Revoked")
@@ -329,17 +302,16 @@ func (ui *LocalVaultUI) showUserManageDialog(rec *vault.UserRecord) {
 	}
 
 	content := container.NewVBox(
-		widget.NewLabelWithStyle(fmt.Sprintf("Managing: %s", rec.Username), fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		widget.NewSeparator(),
-		widget.NewLabel("Assign Role:"),
-		roleSelect,
-		widget.NewSeparator(),
+		makeCenteredHeading(fmt.Sprintf("Managing: %s", rec.Username)),
+		makeDivider(),
+		makeFormRow("Assign Role", roleSelect),
+		makeDivider(),
 		revokeBtn,
 		deleteBtn,
 	)
 
 	var d dialog.Dialog
-	saveRoleBtn := widget.NewButtonWithIcon("Save Role", theme.ConfirmIcon(), func() {
+	saveRoleBtn := makePrimaryBtn("Save Role", theme.ConfirmIcon(), func() {
 		if err := ui.vault.ChangeUserRole(rec.Username, roleSelect.Selected, me); err != nil {
 			dialog.ShowError(err, ui.window)
 			return
@@ -348,7 +320,6 @@ func (ui *LocalVaultUI) showUserManageDialog(rec *vault.UserRecord) {
 		dialog.ShowInformation("Done", fmt.Sprintf("Role updated to %s", roleSelect.Selected), ui.window)
 		ui.showAdminDashboard()
 	})
-	saveRoleBtn.Importance = widget.HighImportance
 
 	revokeBtn.OnTapped = func() {
 		dialog.ShowConfirm("Revoke Access",
@@ -412,21 +383,20 @@ func (ui *LocalVaultUI) showCreateUserDialog() {
 	roleSelect := widget.NewSelect(allRoles, nil)
 	roleSelect.Selected = models.RoleReadOnly
 
-	errorLbl := widget.NewLabelWithStyle("", fyne.TextAlignCenter, fyne.TextStyle{})
-	errorLbl.Importance = widget.DangerImportance
+	errorLbl := makeErrorLabel()
 
-	form := container.New(layout.NewFormLayout(),
-		widget.NewLabel("Username"), usernameEntry,
-		widget.NewLabel("Email"), emailEntry,
-		widget.NewLabel("Password"), passwordEntry,
-		widget.NewLabel("Confirm"), confirmEntry,
-		widget.NewLabel("Role"), roleSelect,
+	form := container.NewVBox(
+		makeFormRow("Username", makeFullWidthEntry(usernameEntry)),
+		makeFormRow("Email", makeFullWidthEntry(emailEntry)),
+		makeFormRow("Password", makeFullWidthEntry(passwordEntry)),
+		makeFormRow("Confirm", makeFullWidthEntry(confirmEntry)),
+		makeFormRow("Role", roleSelect),
 	)
 
 	content := container.NewVBox(form, errorLbl)
 
 	var d dialog.Dialog
-	saveBtn := widget.NewButtonWithIcon("Create User", theme.ContentAddIcon(), func() {
+	saveBtn := makePrimaryBtn("Create User", theme.ContentAddIcon(), func() {
 		errorLbl.SetText("")
 		username := strings.TrimSpace(usernameEntry.Text)
 		email := strings.TrimSpace(emailEntry.Text)
@@ -459,8 +429,6 @@ func (ui *LocalVaultUI) showCreateUserDialog() {
 			ui.window)
 		ui.showAdminDashboard()
 	})
-	saveBtn.Importance = widget.HighImportance
-
 	d = dialog.NewCustom("Create New User", "Cancel",
 		container.NewVBox(content, saveBtn), ui.window)
 	d.Resize(fyne.NewSize(420, 0))
@@ -483,8 +451,8 @@ func (ui *LocalVaultUI) buildAuditTab(initialFilter string) fyne.CanvasObject {
 	var filterFrom, filterTo time.Time // both zero = no filter
 	const noTime = "Any"
 	const timeFmt = "2006-01-02 15:04"
-	fromBtn := widget.NewButton(noTime, nil)
-	toBtn := widget.NewButton(noTime, nil)
+	fromBtn := makeLowBtn(noTime, nil, nil)
+	toBtn := makeLowBtn(noTime, nil, nil)
 
 	// ── Sortable header buttons ───────────────────────────────────────────────
 	sortBtns := make([]*widget.Button, len(colNames))
@@ -551,7 +519,7 @@ func (ui *LocalVaultUI) buildAuditTab(initialFilter string) fyne.CanvasObject {
 				details = "[" + e.ResourceName + "] " + details
 			}
 			cols := [5]string{
-				e.Timestamp.Format("2006-01-02 15:04:05"),
+				e.Timestamp.Local().Format("2006-01-02 15:04:05"),
 				e.Username,
 				e.Event,
 				details,
@@ -691,19 +659,19 @@ func (ui *LocalVaultUI) buildAuditTab(initialFilter string) fyne.CanvasObject {
 
 	// ── Event-type filter buttons ─────────────────────────────────────────────
 	makeBtn := func(label, key string) *widget.Button {
-		btn := widget.NewButton(label, func() { loadEntries(key) })
+		btn := makeLowBtn(label, nil, func() { loadEntries(key) })
 		filterBtns = append(filterBtns, btn)
 		return btn
 	}
 	filterRow := container.NewHBox(
-		widget.NewLabelWithStyle("Filter:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		makeHeading("Filter:"),
 		makeBtn("All", "all"),
 		makeBtn("Logins", "login"),
 		makeBtn("Failed Logins", "failed"),
 		makeBtn("Admin Actions", "admin"),
 		makeBtn("Security", "security"),
 		layout.NewSpacer(),
-		widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), func() {
+		makeLowBtn("Refresh", theme.ViewRefreshIcon(), func() {
 			loadEntries(currentFilter)
 		}),
 	)
@@ -731,7 +699,7 @@ func (ui *LocalVaultUI) buildAuditTab(initialFilter string) fyne.CanvasObject {
 			loadEntries(currentFilter)
 		})
 	}
-	clearTimeBtn := widget.NewButton("Clear", func() {
+	clearTimeBtn := makeLowBtn("Clear", nil, func() {
 		filterFrom = time.Time{}
 		filterTo = time.Time{}
 		fromBtn.SetText(noTime)
@@ -739,9 +707,9 @@ func (ui *LocalVaultUI) buildAuditTab(initialFilter string) fyne.CanvasObject {
 		loadEntries(currentFilter)
 	})
 	dateRow := container.NewHBox(
-		widget.NewLabelWithStyle("From:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		makeHeading("From:"),
 		fromBtn,
-		widget.NewLabelWithStyle("To:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		makeHeading("To:"),
 		toBtn,
 		clearTimeBtn,
 	)
@@ -829,17 +797,17 @@ func (ui *LocalVaultUI) buildSessionsTab() fyne.CanvasObject {
 		if profile.MFAEnabled {
 			mfaTxt = "Yes"
 		}
-		sessionCard = widget.NewCard("Current Session", "",
+		sessionCard = makeSectionCard("Current Session", "",
 			container.NewVBox(
 				container.NewGridWithColumns(2,
-					bold("User:"), widget.NewLabel(ui.currentUser),
-					bold("Role:"), roleLabel(ui.vault.GetRole()),
-					bold("MFA Enabled:"), widget.NewLabel(mfaTxt),
-					bold("Last Login:"), widget.NewLabel(profile.LastLogin.Format("2006-01-02 15:04:05")),
-					bold("Session Active Since:"), widget.NewLabel(ui.lastActivity.Format("2006-01-02 15:04:05")),
+					makeHeading("User:"), widget.NewLabel(ui.currentUser),
+					makeHeading("Role:"), roleLabel(ui.vault.GetRole()),
+					makeHeading("MFA Enabled:"), widget.NewLabel(mfaTxt),
+					makeHeading("Last Login:"), widget.NewLabel(profile.LastLogin.Format("2006-01-02 15:04:05")),
+					makeHeading("Session Active Since:"), widget.NewLabel(ui.lastActivity.Format("2006-01-02 15:04:05")),
 				),
 				widget.NewSeparator(),
-				widget.NewButtonWithIcon("Force Re-login (Lock Vault)", theme.LogoutIcon(), func() {
+				makeDangerBtn("Force Re-login (Lock Vault)", theme.LogoutIcon(), func() {
 					dialog.ShowConfirm("Lock Vault",
 						"This will lock the vault and require re-authentication.",
 						func(ok bool) {
@@ -853,7 +821,7 @@ func (ui *LocalVaultUI) buildSessionsTab() fyne.CanvasObject {
 			),
 		)
 	} else {
-		sessionCard = widget.NewCard("Current Session", "", widget.NewLabel("Session info unavailable."))
+		sessionCard = makeSectionCard("Current Session", "", widget.NewLabel("Session info unavailable."))
 	}
 
 	// Recent login history from audit — use indexed lookups instead of full scan
@@ -930,7 +898,7 @@ func (ui *LocalVaultUI) buildSessionsTab() fyne.CanvasObject {
 				resultLbl.Importance = widget.SuccessImportance
 			}
 			histRows = append(histRows, rowWithWidths([]fyne.CanvasObject{
-				truncLabel(e.Timestamp.Format("2006-01-02 15:04:05")),
+				truncLabel(e.Timestamp.Local().Format("2006-01-02 15:04:05")),
 				truncLabel(e.Username),
 				truncLabel(e.Event),
 				resultLbl,
@@ -963,7 +931,7 @@ func (ui *LocalVaultUI) buildSessionsTab() fyne.CanvasObject {
 
 	histSection := container.NewBorder(
 		container.NewVBox(
-			widget.NewLabelWithStyle("Recent Login History (last 20)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			makeHeading("Recent Login History (last 20)"),
 			widget.NewSeparator(),
 			histHeader,
 			widget.NewSeparator(),
@@ -999,8 +967,7 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 		integrityTxt = "TAMPERED"
 	}
 
-	statCard := container.NewVBox(
-		widget.NewLabelWithStyle("Audit Log Summary", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+	statCard := makeSectionCard("Audit Log Summary", "",
 		container.NewGridWithColumns(3,
 			kv("Total entries", fmt.Sprintf("%d", total)),
 			kv("Failed events", fmt.Sprintf("%d", failures)),
@@ -1011,11 +978,9 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 	// ─ Export buttons ─
 	var exportSection fyne.CanvasObject
 	if canExport {
-		exportSection = container.NewVBox(
-			widget.NewLabelWithStyle("Export Audit Log", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-			widget.NewLabel("Download the full audit trail for SIEM integration or compliance review."),
+		exportSection = makeSectionCard("Export Audit Log", "Download the full audit trail for SIEM integration or compliance review.",
 			container.NewHBox(
-				widget.NewButtonWithIcon("Export JSON", theme.DocumentIcon(), func() {
+				makeSecondaryBtn("Export JSON", theme.DocumentIcon(), func() {
 					dialog.ShowFileSave(func(w fyne.URIWriteCloser, err error) {
 						if err != nil || w == nil {
 							return
@@ -1034,7 +999,7 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 						dialog.ShowInformation("Exported", "Audit log exported as JSON.", ui.window)
 					}, ui.window)
 				}),
-				widget.NewButtonWithIcon("Export CSV", theme.DocumentIcon(), func() {
+				makeSecondaryBtn("Export CSV", theme.DocumentIcon(), func() {
 					dialog.ShowFileSave(func(w fyne.URIWriteCloser, err error) {
 						if err != nil || w == nil {
 							return
@@ -1049,7 +1014,7 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 						dialog.ShowInformation("Exported", "Audit log exported as CSV.", ui.window)
 					}, ui.window)
 				}),
-				widget.NewButtonWithIcon("Export CEF", theme.DocumentIcon(), func() {
+				makeSecondaryBtn("Export CEF", theme.DocumentIcon(), func() {
 					dialog.ShowFileSave(func(w fyne.URIWriteCloser, err error) {
 						if err != nil || w == nil {
 							return
@@ -1064,7 +1029,7 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 						dialog.ShowInformation("Exported", "Audit log exported in Common Event Format.", ui.window)
 					}, ui.window)
 				}),
-				widget.NewButtonWithIcon("Export TXT", theme.DocumentIcon(), func() {
+				makeSecondaryBtn("Export TXT", theme.DocumentIcon(), func() {
 					dialog.ShowFileSave(func(w fyne.URIWriteCloser, err error) {
 						if err != nil || w == nil {
 							return
@@ -1082,8 +1047,7 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 			),
 		)
 	} else {
-		exportSection = container.NewVBox(
-			widget.NewLabelWithStyle("Export Audit Log", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		exportSection = makeSectionCard("Export Audit Log", "",
 			widget.NewLabel("You do not have permission to export audit logs."),
 		)
 	}
@@ -1092,7 +1056,7 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 	backupActionItems := make([]fyne.CanvasObject, 0, 2)
 	if canBackup {
 		backupActionItems = append(backupActionItems,
-			widget.NewButtonWithIcon("Create Backup", theme.ContentCopyIcon(), func() {
+			makePrimaryBtn("Create Backup", theme.ContentCopyIcon(), func() {
 				admin := vault.NewVaultAdmin(ui.vault)
 				info, err := admin.CreateBackup("Manual backup by " + ui.currentUser)
 				if err != nil {
@@ -1107,7 +1071,7 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 	}
 	if canRestore {
 		backupActionItems = append(backupActionItems,
-			widget.NewButtonWithIcon("Restore from Backup", theme.HistoryIcon(), func() {
+			makeDangerBtn("Restore from Backup", theme.HistoryIcon(), func() {
 				admin := vault.NewVaultAdmin(ui.vault)
 				backups, err := admin.ListBackups()
 				if err != nil || len(backups) == 0 {
@@ -1127,7 +1091,7 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 					sel,
 				)
 				var d dialog.Dialog
-				restoreBtn := widget.NewButtonWithIcon("Restore", theme.WarningIcon(), func() {
+				restoreBtn := makeDangerBtn("Restore", theme.WarningIcon(), func() {
 					idx := sel.SelectedIndex()
 					if idx < 0 {
 						return
@@ -1153,7 +1117,6 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 							ui.showLandingScreen()
 						}, ui.window)
 				})
-				restoreBtn.Importance = widget.DangerImportance
 				d = dialog.NewCustom("Restore Vault", "Cancel",
 					container.NewVBox(content, restoreBtn), ui.window)
 				d.Resize(fyne.NewSize(520, 0))
@@ -1165,10 +1128,8 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 		backupActionItems = append(backupActionItems, widget.NewLabel("You do not have permission to create or restore backups."))
 	}
 
-	backupSection := container.NewVBox(
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Vault Backup & Restore", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Create and restore encrypted backups of the vault file (permission restricted)."),
+	backupSection := makeSectionCard("Vault Backup & Restore",
+		"Create and restore encrypted backups of the vault file (permission restricted).",
 		container.NewHBox(backupActionItems...),
 	)
 
@@ -1189,15 +1150,13 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 			}, ui.window)
 		}
 	}
-	reportSection := container.NewVBox(
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Compliance Report", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Export a compliance report of all security checks."),
+	reportSection := makeSectionCard("Compliance Report",
+		"Export a compliance report of all security checks.",
 		container.NewHBox(
-			widget.NewButtonWithIcon("Export JSON", theme.DocumentIcon(), makeComplianceSave(".json", buildComplianceReportJSON)),
-			widget.NewButtonWithIcon("Export CSV", theme.DocumentIcon(), makeComplianceSave(".csv", buildComplianceReportCSV)),
-			widget.NewButtonWithIcon("Export CEF", theme.DocumentIcon(), makeComplianceSave(".cef", buildComplianceReportCEF)),
-			widget.NewButtonWithIcon("Export TXT", theme.FileTextIcon(), makeComplianceSave(".txt", func(ui *LocalVaultUI) []byte {
+			makeSecondaryBtn("Export JSON", theme.DocumentIcon(), makeComplianceSave(".json", buildComplianceReportJSON)),
+			makeSecondaryBtn("Export CSV", theme.DocumentIcon(), makeComplianceSave(".csv", buildComplianceReportCSV)),
+			makeSecondaryBtn("Export CEF", theme.DocumentIcon(), makeComplianceSave(".cef", buildComplianceReportCEF)),
+			makeSecondaryBtn("Export TXT", theme.FileTextIcon(), makeComplianceSave(".txt", func(ui *LocalVaultUI) []byte {
 				return []byte(buildPlainTextComplianceReport(ui))
 			})),
 		),
@@ -1205,9 +1164,11 @@ func (ui *LocalVaultUI) buildExportsTab() fyne.CanvasObject {
 
 	return container.NewPadded(container.NewVBox(
 		statCard,
-		widget.NewSeparator(),
+		makeDivider(),
 		exportSection,
+		makeDivider(),
 		backupSection,
+		makeDivider(),
 		reportSection,
 	))
 }
@@ -1277,7 +1238,7 @@ func (ui *LocalVaultUI) buildSecurityPolicyTab() fyne.CanvasObject {
 	auditRetentionEntry := widget.NewEntry()
 	auditRetentionEntry.SetText(fmt.Sprintf("%d", policy.AuditRetentionDays))
 
-	saveBtn := widget.NewButtonWithIcon("Save Policy", theme.ConfirmIcon(), func() {
+	saveBtn := makePrimaryBtn("Save Policy", theme.ConfirmIcon(), func() {
 		updated := &vault.PersistentSecurityPolicy{
 			MinPasswordLength:     parseInt(minLenEntry.Text, 12),
 			RequireUppercase:      reqUpper.Checked,
@@ -1301,41 +1262,28 @@ func (ui *LocalVaultUI) buildSecurityPolicyTab() fyne.CanvasObject {
 		}
 		dialog.ShowInformation("Saved", "Security policy updated.", ui.window)
 	})
-	saveBtn.Importance = widget.HighImportance
-
 	form := container.NewVBox(
-		widget.NewLabelWithStyle("Password Policy", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewGridWithColumns(2,
-			widget.NewLabel("Min password length:"), minLenEntry,
-			widget.NewLabel("Expiry (days, 0=never):"), expiryEntry,
-			widget.NewLabel("Password history count:"), historyEntry,
-		),
+		makeSectionTitle("Password Policy"),
+		makeFormRow("Min password length:", minLenEntry),
+		makeFormRow("Expiry (days, 0=never):", expiryEntry),
+		makeFormRow("Password history count:", historyEntry),
 		reqUpper, reqLower, reqNumbers, reqSpecial,
 
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("MFA Policy", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		makeSectionTitle("MFA Policy"),
 		mfaRequired,
-		container.NewGridWithColumns(2,
-			widget.NewLabel("Grace period (days):"), graceDaysEntry,
-		),
+		makeFormRow("Grace period (days):", graceDaysEntry),
 
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Lockout & Session", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewGridWithColumns(2,
-			widget.NewLabel("Max failed attempts:"), maxAttemptsEntry,
-			widget.NewLabel("Lockout duration (mins):"), lockoutDurEntry,
-			widget.NewLabel("Inactivity timeout (mins):"), inactivityEntry,
-			widget.NewLabel("Session timeout (mins, 0=unlimited):"), sessionTimeoutEntry,
-			widget.NewLabel("Max concurrent sessions (0=unlimited):"), concurrentSessionsEntry,
-		),
+		makeSectionTitle("Lockout & Session"),
+		makeFormRow("Max failed attempts:", maxAttemptsEntry),
+		makeFormRow("Lockout duration (mins):", lockoutDurEntry),
+		makeFormRow("Inactivity timeout (mins):", inactivityEntry),
+		makeFormRow("Session timeout (mins, 0=unlimited):", sessionTimeoutEntry),
+		makeFormRow("Max concurrent sessions (0=unlimited):", concurrentSessionsEntry),
 
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Audit", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewGridWithColumns(2,
-			widget.NewLabel("Retention (days, 0=forever):"), auditRetentionEntry,
-		),
+		makeSectionTitle("Audit"),
+		makeFormRow("Retention (days, 0=forever):", auditRetentionEntry),
 
-		widget.NewSeparator(),
+		makeDivider(),
 		saveBtn,
 	)
 
@@ -1546,9 +1494,6 @@ func buildComplianceReportCEF(ui *LocalVaultUI) []byte {
 	return []byte(sb.String())
 }
 
-func bold(text string) *widget.Label {
-	return widget.NewLabelWithStyle(text, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-}
 
 func roleLabel(role string) *widget.Label {
 	lbl := widget.NewLabel(role)
@@ -1601,6 +1546,7 @@ func (ui *LocalVaultUI) buildRolePermissionsTab() fyne.CanvasObject {
 	permChecks := make(map[string]map[string]*widget.Check, len(allRoles))
 	for _, role := range allRoles {
 		permChecks[role] = make(map[string]*widget.Check, len(auth.AllPermissions))
+		isAdmin := role == models.RoleAdministrator
 		current := stored[role]
 		currentSet := make(map[string]bool, len(current))
 		for _, p := range current {
@@ -1608,16 +1554,28 @@ func (ui *LocalVaultUI) buildRolePermissionsTab() fyne.CanvasObject {
 		}
 		for _, perm := range auth.AllPermissions {
 			c := widget.NewCheck("", nil)
-			c.Checked = currentSet[perm]
+			if isAdmin {
+				// Administrators always hold every permission — show as checked but
+				// non-interactive so the state cannot be accidentally modified.
+				c.Checked = true
+				c.Disable()
+			} else {
+				c.Checked = currentSet[perm]
+			}
 			permChecks[role][perm] = c
 		}
 	}
 
 	statusLbl := widget.NewLabelWithStyle("", fyne.TextAlignCenter, fyne.TextStyle{})
 
-	saveBtn := widget.NewButtonWithIcon("Save Role Permissions", theme.ConfirmIcon(), func() {
+	saveBtn := makePrimaryBtn("Save Role Permissions", theme.ConfirmIcon(), func() {
 		updated := make(map[string][]string, len(allRoles))
 		for _, role := range allRoles {
+			if role == models.RoleAdministrator {
+				// Administrator permissions are immutable — always grant everything.
+				updated[role] = auth.AllPermissions
+				continue
+			}
 			var perms []string
 			for _, perm := range auth.AllPermissions {
 				if permChecks[role][perm].Checked {
@@ -1632,9 +1590,7 @@ func (ui *LocalVaultUI) buildRolePermissionsTab() fyne.CanvasObject {
 		}
 		ui.showAdminDashboard()
 	})
-	saveBtn.Importance = widget.HighImportance
-
-	resetBtn := widget.NewButtonWithIcon("Reset to Defaults", theme.ViewRefreshIcon(), func() {
+	resetBtn := makeSecondaryBtn("Reset to Defaults", theme.ViewRefreshIcon(), func() {
 		dialog.ShowConfirm("Reset Permissions",
 			"Reset all role permissions to the application defaults?",
 			func(ok bool) {
@@ -1643,6 +1599,9 @@ func (ui *LocalVaultUI) buildRolePermissionsTab() fyne.CanvasObject {
 				}
 				defaults := auth.DefaultRolePermissions()
 				for _, role := range allRoles {
+					if role == models.RoleAdministrator {
+						continue // already locked checked — nothing to reset
+					}
 					defaultSet := make(map[string]bool)
 					for _, p := range defaults[role] {
 						defaultSet[p] = true
@@ -1696,15 +1655,13 @@ func (ui *LocalVaultUI) buildRolePermissionsTab() fyne.CanvasObject {
 		container.NewHBox(saveBtn, resetBtn),
 	)
 
-	note := widget.NewLabelWithStyle(
-		"Changes take effect immediately for all active sessions after saving.",
-		fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
+	note := makeSubheading("Changes take effect immediately for all active sessions after saving.")
 
 	return container.NewBorder(
 		container.NewVBox(
-			widget.NewLabelWithStyle("RBAC Role Permissions", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			makeHeading("RBAC Role Permissions"),
 			note,
-			widget.NewSeparator(),
+			makeDivider(),
 		),
 		nil, nil, nil,
 		boundedScroll(container.NewPadded(container.NewVBox(allRows...))),

@@ -10,6 +10,7 @@ import (
 	"password-manager/internal/models"
 	"password-manager/internal/secrets"
 	"password-manager/internal/vault"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -31,16 +33,25 @@ type LocalVaultUI struct {
 	window           fyne.Window
 	vault            *vault.VaultWithUser
 	clipboardManager *secrets.ClipboardManager
-	currentUser      string
-	savedPassword    string
-	content          *fyne.Container
-	lastActivity     time.Time     // for inactivity auto-lock (Req 3.6)
-	activityMu       sync.RWMutex  // protects lastActivity
+	currentUser   string
+	savedPassword []byte // master password held briefly for MFA flow; zeroed immediately after use
+	content       *fyne.Container
+	lastActivity     time.Time    // for inactivity auto-lock (Req 3.6)
+	activityMu       sync.RWMutex // protects lastActivity
 	activityCancel   chan struct{} // closed to stop the inactivity goroutine
-	vaultKeyVerified bool          // true once vault access key verified this session
+	vaultKeyVerified bool         // true once vault access key verified this session
 	chainMonitorStop chan struct{} // closed to stop the chain integrity monitor goroutine
 	vaultTamperStop  chan struct{} // closed to stop the vault file tamper monitor goroutine
 	onMainScreen     bool         // true when the split main layout is active (sidebar visible)
+	formDirty        bool         // true when add/edit form has unsaved changes
+	detailBack       func()       // the "← Back" destination for the current detail view
+}
+
+// sidebarNavItem groups a nav button with its left-accent bar and wrapper container.
+type sidebarNavItem struct {
+	btn  *widget.Button
+	bar  *canvas.Rectangle
+	wrap fyne.CanvasObject
 }
 
 var localUI *LocalVaultUI
@@ -72,43 +83,316 @@ func InitializeLocalUI(app fyne.App, window fyne.Window, v *vault.VaultWithUser)
 	// Always start at the landing screen (Login / Register choice)
 	localUI.showLandingScreen()
 
+	window.SetFixedSize(false)
 	window.Resize(fyne.NewSize(1100, 720))
 	window.CenterOnScreen()
 }
 
-// copyrightFooter returns the copyright bar pinned to the bottom of every screen.
-func copyrightFooter() fyne.CanvasObject {
-	lbl := widget.NewLabelWithStyle(
-		"\u00a9 2026 Kagiso Setwaba \u00b7 All rights reserved \u00b7 Password Manager v1.0",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{Italic: true},
-	)
-	lbl.Importance = widget.LowImportance
-	return container.NewVBox(widget.NewSeparator(), container.NewPadded(lbl))
-}
-
-// withFooter wraps any screen content in a border layout with the copyright
-// bar pinned to the bottom and a dark/light mode toggle pinned to the top-right.
-// This runs on every screen so the toggle is always visible.
+// withFooter wraps any screen content with a footer bar (copyright + theme icon).
+// No top bar — the theme toggle icon sits in the footer to keep the UI minimal.
 func (ui *LocalVaultUI) withFooter(content fyne.CanvasObject) fyne.CanvasObject {
-	themeLabel := func() string {
-		if IsDarkMode() {
-			return "☀ Light Mode"
-		}
-		return "🌙 Dark Mode"
-	}
 	var themeBtn *widget.Button
-	themeBtn = widget.NewButtonWithIcon(themeLabel(), theme.VisibilityIcon(), func() {
+	themeBtn = widget.NewButtonWithIcon("", theme.ColorPaletteIcon(), func() {
 		SetDarkMode(ui.app, !IsDarkMode())
-		themeBtn.SetText(themeLabel())
 		if ui.onMainScreen {
 			ui.showMainScreen()
+		} else {
+			ui.window.SetContent(ui.window.Content())
+			ui.window.Content().Refresh()
 		}
 	})
 	themeBtn.Importance = widget.LowImportance
 
-	topBar := container.NewHBox(layout.NewSpacer(), themeBtn)
-	return container.NewBorder(topBar, copyrightFooter(), nil, nil, content)
+	lbl := widget.NewLabelWithStyle(
+		"© 2026 Kagiso Setwaba · All rights reserved · Password Manager v1.0",
+		fyne.TextAlignCenter,
+		fyne.TextStyle{Italic: true},
+	)
+	lbl.Importance = widget.LowImportance
+
+	footer := container.NewVBox(
+		widget.NewSeparator(),
+		container.NewBorder(nil, nil, nil, themeBtn, container.NewPadded(lbl)),
+	)
+	return container.NewBorder(nil, footer, nil, nil, content)
+}
+// guardNavigation checks for unsaved form changes before executing a nav action.
+// If formDirty is true the user is asked to confirm before leaving the form.
+func (ui *LocalVaultUI) guardNavigation(fn func()) {
+	if !ui.formDirty {
+		fn()
+		return
+	}
+	dialog.ShowConfirm("Unsaved Changes",
+		"You have unsaved changes that will be lost. Leave this page?",
+		func(ok bool) {
+			if ok {
+				ui.formDirty = false
+				fn()
+			}
+		}, ui.window)
+}
+
+// showAbout renders the About view inside the main content pane so it follows
+// the same split-layout pattern as every other nav destination.
+func (ui *LocalVaultUI) showAbout() {
+	ui.resetActivity()
+
+	title := widget.NewLabelWithStyle("Password Manager", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	version := widget.NewLabelWithStyle("Version "+AppVersion, fyne.TextAlignCenter, fyne.TextStyle{})
+	version.Importance = widget.LowImportance
+	publisher := widget.NewLabelWithStyle("By Kagiso Setwaba", fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
+	publisher.Importance = widget.LowImportance
+
+	features := container.NewVBox(
+		widget.NewLabelWithStyle("Built with:", fyne.TextAlignCenter, fyne.TextStyle{}),
+		makeMutedLabel("• AES-256-GCM encryption"),
+		makeMutedLabel("• Argon2id key derivation"),
+		makeMutedLabel("• TOTP multi-factor authentication"),
+		makeMutedLabel("• Role-based access control"),
+		makeMutedLabel("• Tamper-resistant audit logging"),
+		makeMutedLabel("• Local vault file (.pwm) — your data never leaves your device"),
+	)
+
+	card := makeSectionCard("About", "", container.NewVBox(
+		container.NewPadded(container.NewVBox(
+			container.NewCenter(title),
+			container.NewCenter(version),
+			widget.NewSeparator(),
+			container.NewCenter(features),
+			widget.NewSeparator(),
+			container.NewCenter(publisher),
+		)),
+	))
+
+	header := makePageHeader("About", "Password Manager information", nil)
+	ui.content.Objects = []fyne.CanvasObject{
+		container.NewBorder(header, nil, nil, nil,
+			boundedScroll(container.NewPadded(card)),
+		),
+	}
+	ui.content.Refresh()
+}
+
+// showVaultHealth renders a Vault Health dashboard showing password hygiene
+// metrics and security integrity indicators (tamper detection, audit chain, MFA).
+func (ui *LocalVaultUI) showVaultHealth() {
+	ui.resetActivity()
+	report, err := ui.vault.GetHealthReport()
+	if err != nil {
+		ui.showError("Failed to load vault health", err)
+		return
+	}
+
+	scoreColor := func(bad, total int) fyne.TextStyle {
+		_ = total
+		if bad == 0 {
+			return fyne.TextStyle{}
+		}
+		return fyne.TextStyle{Bold: true}
+	}
+	scoreImportance := func(bad int) widget.Importance {
+		if bad == 0 {
+			return widget.SuccessImportance
+		}
+		return widget.DangerImportance
+	}
+
+	makeStat := func(label string, bad, total int, names []string, fix string) fyne.CanvasObject {
+		pct := 0
+		if total > 0 {
+			pct = 100 * (total - bad) / total
+		}
+		titleLbl := widget.NewLabelWithStyle(label, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+		countLbl := widget.NewLabelWithStyle(
+			fmt.Sprintf("%d affected  ·  %d%% healthy", bad, pct),
+			fyne.TextAlignLeading, scoreColor(bad, total),
+		)
+		countLbl.Importance = scoreImportance(bad)
+
+		body := container.NewVBox(titleLbl, countLbl)
+
+		if bad > 0 && len(names) > 0 {
+			nameList := strings.Join(names, ",  ")
+			if bad > len(names) {
+				nameList += fmt.Sprintf("  … and %d more", bad-len(names))
+			}
+			detail := widget.NewLabel(nameList)
+			detail.Wrapping = fyne.TextWrapWord
+			detail.Importance = widget.LowImportance
+
+			fixLbl := makeMutedLabel(fix)
+			fixLbl.Wrapping = fyne.TextWrapWord
+			body.Add(detail)
+			body.Add(fixLbl)
+		}
+
+		return widget.NewCard("", "", container.NewPadded(body))
+	}
+
+	// makeSecurityCard renders a single security indicator row.
+	makeSecurityCard := func(title, statusText string, imp widget.Importance, detail string) fyne.CanvasObject {
+		titleLbl := widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+		statusLbl := widget.NewLabel(statusText)
+		statusLbl.Importance = imp
+		body := container.NewVBox(titleLbl, statusLbl)
+		if detail != "" {
+			d := makeMutedLabel(detail)
+			d.Wrapping = fyne.TextWrapWord
+			body.Add(d)
+		}
+		return widget.NewCard("", "", container.NewPadded(body))
+	}
+
+	// ── Overall issue count ───────────────────────────────────────────────────
+	canViewIntegrity := ui.vault.HasPermission(auth.CanViewAuditLogs)
+	totalIssues := report.Weak + report.Old + report.Reused + report.NoPassword
+	if canViewIntegrity && report.VaultFileTampered {
+		totalIssues++
+	}
+	if canViewIntegrity && (!report.AuditChainIntact || report.AuditTampered > 0) {
+		totalIssues++
+	}
+	if !report.MFAEnabled {
+		totalIssues++
+	}
+
+	overallIcon := theme.ConfirmIcon()
+	overallText := "Your vault looks healthy!"
+	if totalIssues > 0 {
+		overallIcon = theme.WarningIcon()
+		overallText = fmt.Sprintf("%d issue(s) found — review the sections below", totalIssues)
+	}
+	overallBanner := container.NewHBox(
+		widget.NewIcon(overallIcon),
+		widget.NewLabelWithStyle(overallText, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+	)
+
+	// ── Password hygiene section ──────────────────────────────────────────────
+	content := container.NewVBox(
+		container.NewPadded(overallBanner),
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Password Hygiene", fyne.TextAlignLeading, fyne.TextStyle{Bold: true, Italic: true}),
+		makeStat("Weak Passwords", report.Weak, report.Total, report.WeakNames,
+			"Tip: use at least 12 characters with uppercase, lowercase, digits, and symbols."),
+		makeStat("Old Passwords (>1 year)", report.Old, report.Total, report.OldNames,
+			"Tip: rotate credentials that haven't changed in over a year."),
+		makeStat("Reused Passwords", report.Reused, report.Total, report.ReusedNames,
+			"Tip: every account should have a unique password."),
+	)
+	if report.NoPassword > 0 {
+		np := widget.NewLabelWithStyle(
+			fmt.Sprintf("%d entries have no password stored.", report.NoPassword),
+			fyne.TextAlignLeading, fyne.TextStyle{},
+		)
+		np.Importance = widget.WarningImportance
+		content.Add(widget.NewCard("", "", container.NewPadded(np)))
+	}
+
+	// ── Security integrity section (SecurityOfficer / Administrator only) ───────
+	if ui.vault.HasPermission(auth.CanViewAuditLogs) {
+		content.Add(widget.NewSeparator())
+		content.Add(widget.NewLabelWithStyle("Security Integrity", fyne.TextAlignLeading, fyne.TextStyle{Bold: true, Italic: true}))
+
+		// Vault file tamper detection
+		if report.VaultFileTampered {
+			content.Add(makeSecurityCard(
+				"Vault File Integrity",
+				"WARNING: vault file was modified outside the application",
+				widget.DangerImportance,
+				"The vault file on disk has a newer modification time than the last in-app save. "+
+					"This may indicate external tampering. Re-lock and re-unlock to refresh the check.",
+			))
+		} else {
+			content.Add(makeSecurityCard(
+				"Vault File Integrity",
+				"Vault file has not been modified outside the application",
+				widget.SuccessImportance, "",
+			))
+		}
+
+		// Audit log chain integrity
+		auditStatusText := fmt.Sprintf(
+			"Verified: %d  ·  Tampered: %d  ·  Unverifiable: %d",
+			report.AuditVerified, report.AuditTampered, report.AuditUnverifiable,
+		)
+		auditDetail := ""
+		var auditImp widget.Importance
+		switch {
+		case report.AuditTampered > 0 || !report.AuditChainIntact:
+			auditImp = widget.DangerImportance
+			auditDetail = "One or more audit entries have a broken or invalid HMAC checksum. " +
+				"The audit log may have been modified externally."
+		case report.AuditUnverifiable > 0:
+			auditImp = widget.WarningImportance
+			auditDetail = "Some entries were created before audit signing was enabled and cannot be verified."
+		default:
+			auditImp = widget.SuccessImportance
+		}
+		chainStatus := "Chain intact"
+		if !report.AuditChainIntact {
+			chainStatus = "Chain BROKEN"
+		}
+		content.Add(makeSecurityCard(
+			"Audit Log Integrity",
+			fmt.Sprintf("%s  ·  %s", chainStatus, auditStatusText),
+			auditImp, auditDetail,
+		))
+	}
+
+	// ── MFA & security policy (visible to all authenticated users) ───────────
+	// MFA & security policy
+	mfaText := "MFA is enabled and verified for your account"
+	mfaImp := widget.SuccessImportance
+	mfaDetail := ""
+	if !report.MFAEnabled {
+		mfaText = "MFA is not enabled for your account"
+		mfaImp = widget.WarningImportance
+		if report.MFARequired {
+			mfaText = "MFA is required by policy but not enabled on your account"
+			mfaImp = widget.DangerImportance
+		}
+		mfaDetail = "Enable MFA from Settings > Security to protect your account with a second factor."
+	}
+	policyDetail := ""
+	if !report.HasSecurityPolicy {
+		policyDetail = "No security policy is configured. Admins can set password expiry, MFA requirements, and session controls in the Admin Dashboard."
+	} else {
+		if report.PasswordExpiryDays > 0 {
+			policyDetail = fmt.Sprintf("Password rotation policy: every %d days.", report.PasswordExpiryDays)
+		} else {
+			policyDetail = "No password expiry policy configured."
+		}
+	}
+	content.Add(makeSecurityCard("MFA Status", mfaText, mfaImp, mfaDetail))
+	content.Add(makeSecurityCard(
+		"Security Policy",
+		func() string {
+			if report.HasSecurityPolicy {
+				return "Security policy is active"
+			}
+			return "No security policy configured"
+		}(),
+		func() widget.Importance {
+			if report.HasSecurityPolicy {
+				return widget.SuccessImportance
+			}
+			return widget.WarningImportance
+		}(),
+		policyDetail,
+	))
+
+	header := makePageHeader(
+		"Vault Health",
+		fmt.Sprintf("%d secrets analysed", report.Total),
+		nil,
+	)
+	ui.content.Objects = []fyne.CanvasObject{
+		container.NewBorder(header, nil, nil, nil,
+			boundedScroll(container.NewPadded(content)),
+		),
+	}
+	ui.content.Refresh()
 }
 
 // showLandingScreen shows the welcome screen with Login and Register options.
@@ -127,47 +411,59 @@ func (ui *LocalVaultUI) showLandingScreen() {
 		ui.vaultTamperStop = nil
 	}
 	ui.vaultKeyVerified = false // reset vault key verification on every logout/landing
+	// Clear any sensitive credentials held in the struct across screen transitions.
+	zeroAndClearBytes(ui.savedPassword)
+	ui.savedPassword = nil
+	ui.currentUser = ""
 	if ui.clipboardManager != nil {
 		ui.clipboardManager.ClearClipboard()
 	}
 
-	widthEnforcer := canvas.NewRectangle(color.Transparent)
-	widthEnforcer.SetMinSize(fyne.NewSize(480, 1))
-
-	appName := widget.NewLabelWithStyle("Password Manager", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-	appSub := widget.NewLabelWithStyle("Secure Enterprise Vault", fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
-
 	usernameEntry := widget.NewEntry()
-	usernameEntry.SetPlaceHolder("Username")
+	usernameEntry.SetPlaceHolder("Enter your username")
 
-	passwordEntry := widget.NewPasswordEntry()
-	passwordEntry.SetPlaceHolder("Password")
+	passwordEntry := widget.NewEntry()
+	passwordEntry.Password = true
+	passwordEntry.SetPlaceHolder("Enter your password")
 
 	// MFA row — hidden until password is accepted and MFA is confirmed active.
-	mfaEntry := widget.NewEntry()
+	// Password-style entry masks the code to prevent shoulder-surfing.
+	mfaEntry := widget.NewPasswordEntry()
 	mfaEntry.SetPlaceHolder("6-digit code from your authenticator app")
-	mfaHint := widget.NewLabelWithStyle(
-		"Open Microsoft Authenticator, find the Password Manager entry, and type the 6-digit code shown.",
-		fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
-	mfaHint.Importance = widget.LowImportance
+	mfaEntry.OnChanged = func(s string) {
+		filtered := ""
+		for _, r := range s {
+			if r >= '0' && r <= '9' {
+				filtered += string(r)
+			}
+		}
+		if len(filtered) > 6 {
+			filtered = filtered[:6]
+		}
+		if filtered != s {
+			mfaEntry.SetText(filtered)
+		}
+	}
+	mfaHint := makeMutedLabel("Open your authenticator app (Microsoft Authenticator, Google Authenticator, Authy, etc.) and enter the 6-digit code shown.")
 	mfaRow := container.NewVBox(
-		container.New(layout.NewFormLayout(), widget.NewLabel("MFA Code"), mfaEntry),
+		makeFormRow("MFA Code", mfaEntry),
 		container.NewPadded(mfaHint),
 	)
 	mfaRow.Hide() // shown only after password accepted + MFA required
 
-	errorLabel := widget.NewLabelWithStyle("", fyne.TextAlignCenter, fyne.TextStyle{})
-	errorLabel.Importance = widget.DangerImportance
+	errorLabel := makeErrorLabel()
 
 	// mfaRequired tracks whether we've already verified the password and are
 	// now waiting for a TOTP code.
 	mfaRequired := false
 	savedUsername := ""
-	savedPassword := ""
+	var savedPassword []byte
 	// Forward-declare so helper/button closures can reference it before assignment.
 	var loginBtn *widget.Button
 	resetMFAStep := func() {
 		mfaRequired = false
+		zeroAndClearBytes(savedPassword)
+		savedPassword = nil
 		mfaEntry.SetText("")
 		mfaRow.Hide()
 		loginBtn.SetText("Login")
@@ -175,7 +471,7 @@ func (ui *LocalVaultUI) showLandingScreen() {
 		passwordEntry.Enable()
 	}
 
-	loginBtn = widget.NewButtonWithIcon("Login", theme.LoginIcon(), func() {
+	loginBtn = makePrimaryBtn("Login", theme.LoginIcon(), func() {
 		errorLabel.SetText("")
 		username := strings.TrimSpace(usernameEntry.Text)
 		password := passwordEntry.Text
@@ -197,11 +493,11 @@ func (ui *LocalVaultUI) showLandingScreen() {
 			}
 			firstLogin := !ui.vault.Vault.Exists()
 			ip := localIPAddress()
-			if err := ui.vault.LoginWithMFA(savedUsername, savedPassword, mfaCode, ip); err != nil {
+			if err := ui.vault.LoginWithMFA(savedUsername, string(savedPassword), mfaCode, ip); err != nil {
 				if strings.Contains(err.Error(), "MFA setup required") || strings.Contains(err.Error(), "MFA not set up") {
 					resetMFAStep()
 					ui.currentUser = savedUsername
-					ui.savedPassword = savedPassword
+					ui.savedPassword = append(ui.savedPassword[:0:0], savedPassword...)
 					ui.startMandatoryMFAEnrollment()
 					return
 				}
@@ -224,8 +520,9 @@ func (ui *LocalVaultUI) showLandingScreen() {
 			if strings.Contains(err.Error(), "MFA setup required") || strings.Contains(err.Error(), "MFA not set up") {
 				// User needs to enroll (QR) rather than enter a code.
 				savedUsername = username
-				savedPassword = password
-				ui.savedPassword = password
+				savedPassword = []byte(password)
+				zeroAndClearBytes(ui.savedPassword)
+				ui.savedPassword = []byte(password)
 				ui.currentUser = username
 				ui.startMandatoryMFAEnrollment()
 				return
@@ -233,22 +530,24 @@ func (ui *LocalVaultUI) showLandingScreen() {
 			if strings.Contains(err.Error(), "MFA required") {
 				// Password accepted — now ask for the TOTP code.
 				savedUsername = username
-				savedPassword = password
-				ui.savedPassword = password
+				savedPassword = []byte(password)
+				zeroAndClearBytes(ui.savedPassword)
+				ui.savedPassword = []byte(password)
 				mfaRequired = true
 				mfaRow.Show()
 				loginBtn.SetText("Verify Code")
 				usernameEntry.Disable()
+				passwordEntry.Password = true
+				passwordEntry.Refresh()
 				passwordEntry.Disable()
 				errorLabel.SetText("")
 				ui.window.Canvas().Focus(mfaEntry)
 				return
 			}
 			switch {
-			case errors.Is(err, vault.ErrUserNotFound):
-				errorLabel.SetText("User does not exist")
-			case errors.Is(err, vault.ErrInvalidPassword):
-				errorLabel.SetText("Invalid password")
+			case errors.Is(err, vault.ErrUserNotFound), errors.Is(err, vault.ErrInvalidPassword):
+				// Use a single message for both to prevent username enumeration.
+				errorLabel.SetText("Invalid username or password")
 			default:
 				errorLabel.SetText(err.Error())
 			}
@@ -274,38 +573,50 @@ func (ui *LocalVaultUI) showLandingScreen() {
 		}
 		ui.enforcePasswordExpiry()
 	})
-	loginBtn.Importance = widget.HighImportance
 	passwordEntry.OnSubmitted = func(_ string) { loginBtn.OnTapped() }
 	mfaEntry.OnSubmitted = func(_ string) { loginBtn.OnTapped() }
 
-	registerLink := widget.NewHyperlink("Don't have an account? Register here", nil)
-	registerLink.OnTapped = func() { ui.showRegistrationScreen() }
+	registerHint := makeMutedLabel("New here?")
+	registerBtn := makeSecondaryBtn("Create Account", nil, func() {
+		ui.showRegistrationScreen()
+	})
 
-	formFields := container.New(layout.NewFormLayout(),
-		widget.NewLabel("Username"), usernameEntry,
-		widget.NewLabel("Password"), passwordEntry,
+	formFields := container.NewVBox(
+		makeFormRow("Username", makeFullWidthEntry(usernameEntry)),
+		makeFormRow("Password", makeFullWidthEntry(passwordEntry)),
 	)
 
-	loginCard := widget.NewCard("Welcome Back", "Sign in to your encrypted vault",
-		container.NewVBox(
-			container.NewPadded(container.NewVBox(appName, appSub)),
-			widget.NewSeparator(),
-			container.NewPadded(formFields),
-			container.NewPadded(mfaRow),
-			widget.NewSeparator(),
-			errorLabel,
-			loginBtn,
-			widget.NewSeparator(),
-			container.NewCenter(registerLink),
-		),
+	loginBody := container.NewVBox(
+		container.NewPadded(formFields),
+		container.NewPadded(mfaRow),
+		makeDivider(),
+		errorLabel,
+		container.NewPadded(loginBtn),
+		makeDivider(),
+		container.NewCenter(container.NewHBox(registerHint, registerBtn)),
 	)
+
+	loginCard := makeAuthCard("Welcome Back", "Sign in to your encrypted vault", loginBody)
+
+	var logoHeader fyne.CanvasObject
+	if AppIcon != nil {
+		img := canvas.NewImageFromResource(AppIcon)
+		img.SetMinSize(fyne.NewSize(72, 72))
+		img.FillMode = canvas.ImageFillContain
+		logoHeader = container.NewCenter(img)
+	} else {
+		logoHeader = container.NewCenter(widget.NewIcon(theme.DocumentIcon()))
+	}
 
 	ui.window.SetContent(ui.withFooter(container.NewCenter(
 		container.NewVBox(
-			widthEnforcer,
-			container.NewPadded(loginCard),
+			minWidth(480),
+			logoHeader,
+			widget.NewLabel(""),
+			loginCard,
 		),
 	)))
+	ui.window.Canvas().Focus(usernameEntry)
 }
 
 // localIPAddress attempts to return a non-loopback IPv4 address for this host.
@@ -334,17 +645,11 @@ func localIPAddress() string {
 // MFA enrollment will be triggered automatically.
 func (ui *LocalVaultUI) showRegistrationScreen() {
 	ui.onMainScreen = false
-	widthEnforcer := canvas.NewRectangle(color.Transparent)
-	widthEnforcer.SetMinSize(fyne.NewSize(520, 1))
-
-	appName := widget.NewLabelWithStyle("Password Manager", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-	appSub := widget.NewLabelWithStyle("Create Your Account", fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
-
 	usernameEntry := widget.NewEntry()
-	usernameEntry.SetPlaceHolder("Username (min 3 characters)")
+	usernameEntry.SetPlaceHolder("Minimum 3 characters")
 
 	emailEntry := widget.NewEntry()
-	emailEntry.SetPlaceHolder("Email (optional)")
+	emailEntry.SetPlaceHolder("Optional — used for recovery")
 
 	passwordEntry := widget.NewPasswordEntry()
 	passwordEntry.SetPlaceHolder("Minimum 12 characters")
@@ -352,8 +657,7 @@ func (ui *LocalVaultUI) showRegistrationScreen() {
 	confirmEntry := widget.NewPasswordEntry()
 	confirmEntry.SetPlaceHolder("Re-enter password")
 
-	errorLabel := widget.NewLabelWithStyle("", fyne.TextAlignCenter, fyne.TextStyle{})
-	errorLabel.Importance = widget.DangerImportance
+	errorLabel := makeErrorLabel()
 
 	doRegister := func() {
 		errorLabel.SetText("")
@@ -447,46 +751,41 @@ func (ui *LocalVaultUI) showRegistrationScreen() {
 		dlg.Show()
 	}
 
-	registerBtn := widget.NewButtonWithIcon("Register & Set Up MFA", theme.AccountIcon(), func() { doRegister() })
-	registerBtn.Importance = widget.HighImportance
+	registerBtn := makePrimaryBtn("Create Account & Set Up MFA", theme.AccountIcon(), func() { doRegister() })
 	confirmEntry.OnSubmitted = func(_ string) { doRegister() }
 
-	reqNote := widget.NewLabelWithStyle(
-		"Password must meet the configured security policy requirements",
-		fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
-	reqNote.Importance = widget.LowImportance
+	reqNote := makeMutedLabel("Password must meet the configured security policy requirements")
+	reqNote.Truncation = fyne.TextTruncateEllipsis
 
-	formFields := container.New(layout.NewFormLayout(),
-		widget.NewLabel("Username"), usernameEntry,
-		widget.NewLabel("Email (optional)"), emailEntry,
-		widget.NewLabel("Password"), passwordEntry,
-		widget.NewLabel("Confirm Password"), confirmEntry,
+	formFields := container.NewVBox(
+		makeFormRow("Username", makeFullWidthEntry(usernameEntry)),
+		makeFormRow("Email", makeFullWidthEntry(emailEntry)),
+		makeFormRow("Password", makeFullWidthEntry(passwordEntry)),
+		makeFormRow("Confirm", makeFullWidthEntry(confirmEntry)),
 	)
 
-	backLink := widget.NewHyperlink("← Back to Login", nil)
-	backLink.OnTapped = func() { ui.showLandingScreen() }
+	backBtn := makeLowBtn("Back to Login", theme.NavigateBackIcon(), func() { ui.showLandingScreen() })
 
-	regCard := widget.NewCard("Create Account", "Set up your encrypted password vault",
-		container.NewVBox(
-			container.NewPadded(container.NewVBox(appName, appSub)),
-			widget.NewSeparator(),
-			reqNote,
-			widget.NewSeparator(),
-			container.NewPadded(formFields),
-			widget.NewSeparator(),
-			errorLabel,
-			registerBtn,
-			widget.NewSeparator(),
-			container.NewCenter(backLink),
-		),
+	regBody := container.NewVBox(
+		container.NewPadded(reqNote),
+		makeDivider(),
+		container.NewPadded(formFields),
+		makeDivider(),
+		errorLabel,
+		container.NewPadded(registerBtn),
+		makeDivider(),
+		container.NewCenter(backBtn),
 	)
+
+	regCard := makeAuthCard("Create Account", "Set up your encrypted password vault", regBody)
 
 	ui.window.SetContent(ui.withFooter(container.NewCenter(
 		container.NewVBox(
-			widthEnforcer,
-			container.NewPadded(regCard),
+			minWidth(480),
+			regCard,
 		),
 	)))
+	ui.window.Canvas().Focus(usernameEntry)
 }
 
 // showNewVaultScreen is shown after the very first login following registration.
@@ -494,50 +793,37 @@ func (ui *LocalVaultUI) showRegistrationScreen() {
 // before they enter the main application.
 func (ui *LocalVaultUI) showNewVaultScreen() {
 	ui.onMainScreen = false
-	widthEnforcer := canvas.NewRectangle(color.Transparent)
-	widthEnforcer.SetMinSize(fyne.NewSize(520, 1))
 
-	appName := widget.NewLabelWithStyle("Password Manager", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	appTitle := makeCenteredHeading("Password Manager")
 	appSub := widget.NewLabelWithStyle("Secure Enterprise Vault", fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
+	appSub.Importance = widget.LowImportance
 
-	successTitle := widget.NewLabelWithStyle(
-		"Your encrypted vault is ready!",
-		fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	successTitle := widget.NewLabelWithStyle("Your encrypted vault is ready!", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 	successTitle.Importance = widget.SuccessImportance
 
-	vaultPath := widget.NewLabelWithStyle(
-		fmt.Sprintf("Vault file: %s", ui.vault.Vault.GetFilePath()),
-		fyne.TextAlignCenter, fyne.TextStyle{})
-	vaultPath.Importance = widget.LowImportance
+	vaultPath := makeMutedLabel(fmt.Sprintf("Vault file: %s", ui.vault.Vault.GetFilePath()))
+	infoText := makeMutedLabel("Encrypted with AES-256-GCM  ·  Keys derived with Argon2id\nKeep your password safe — it cannot be recovered if lost.")
 
-	infoText := widget.NewLabelWithStyle(
-		"Encrypted with AES-256-GCM  ·  Keys derived with Argon2id\nKeep your password safe — it cannot be recovered if lost.",
-		fyne.TextAlignCenter, fyne.TextStyle{})
-	infoText.Importance = widget.LowImportance
-
-	continueBtn := widget.NewButtonWithIcon("Open My Vault  →", theme.NavigateNextIcon(), func() {
-		ui.gotoMainScreen()
-	})
-	continueBtn.Importance = widget.HighImportance
+	continueBtn := makePrimaryBtn("Open My Vault  →", theme.NavigateNextIcon(), func() { ui.gotoMainScreen() })
 
 	card := widget.NewCard("Vault Setup Complete", "",
 		container.NewVBox(
-			container.NewPadded(container.NewVBox(appName, appSub)),
-			widget.NewSeparator(),
+			container.NewPadded(container.NewVBox(appTitle, appSub)),
+			makeDivider(),
 			container.NewPadded(container.NewVBox(
 				successTitle,
-				widget.NewSeparator(),
+				makeDivider(),
 				vaultPath,
 				infoText,
 			)),
-			widget.NewSeparator(),
+			makeDivider(),
 			continueBtn,
 		),
 	)
 
 	ui.window.SetContent(ui.withFooter(container.NewCenter(
 		container.NewVBox(
-			widthEnforcer,
+			minWidth(480),
 			container.NewPadded(card),
 		),
 	)))
@@ -561,18 +847,15 @@ func (ui *LocalVaultUI) gotoMainScreen() {
 // onSuccess is called once the correct key is entered.
 func (ui *LocalVaultUI) showVaultKeyScreen(onSuccess func()) {
 	ui.onMainScreen = false
-	widthEnforcer := canvas.NewRectangle(color.Transparent)
-	widthEnforcer.SetMinSize(fyne.NewSize(440, 1))
 
 	keyEntry := widget.NewPasswordEntry()
 	keyEntry.SetPlaceHolder("Enter vault access key")
 
-	errorLabel := widget.NewLabelWithStyle("", fyne.TextAlignCenter, fyne.TextStyle{})
-	errorLabel.Importance = widget.DangerImportance
+	errorLabel := makeErrorLabel()
 
 	attempts := 0
 	var unlockBtn *widget.Button
-	unlockBtn = widget.NewButtonWithIcon("Unlock Vault", theme.ConfirmIcon(), func() {
+	unlockBtn = makePrimaryBtn("Unlock Vault", theme.ConfirmIcon(), func() {
 		key := keyEntry.Text
 		if key == "" {
 			errorLabel.SetText("Please enter the vault access key")
@@ -601,7 +884,6 @@ func (ui *LocalVaultUI) showVaultKeyScreen(onSuccess func()) {
 		}
 		onSuccess()
 	})
-	unlockBtn.Importance = widget.HighImportance
 	keyEntry.OnSubmitted = func(_ string) { unlockBtn.OnTapped() }
 
 	logoutLink := widget.NewHyperlink("← Logout", nil)
@@ -612,20 +894,11 @@ func (ui *LocalVaultUI) showVaultKeyScreen(onSuccess func()) {
 		ui.showLandingScreen()
 	}
 
-	desc := widget.NewLabelWithStyle(
-		"This vault requires an additional access key.\nContact your administrator if you don't have it.",
-		fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
-	desc.Importance = widget.LowImportance
-	desc.Wrapping = fyne.TextWrapWord
-
-	card := widget.NewCard("Vault Access Key Required", "",
+	card := makeAuthCard("Vault Access Key Required",
+		"This vault requires an additional access key. Contact your administrator if you don't have it.",
 		container.NewVBox(
-			container.NewPadded(desc),
-			widget.NewSeparator(),
-			container.NewPadded(container.New(layout.NewFormLayout(),
-				widget.NewLabel("Vault Key"), keyEntry,
-			)),
-			widget.NewSeparator(),
+			container.NewPadded(makeFormRow("Vault Key", keyEntry)),
+			makeDivider(),
 			errorLabel,
 			unlockBtn,
 			container.NewCenter(logoutLink),
@@ -634,7 +907,7 @@ func (ui *LocalVaultUI) showVaultKeyScreen(onSuccess func()) {
 
 	ui.window.SetContent(ui.withFooter(container.NewCenter(
 		container.NewVBox(
-			widthEnforcer,
+			minWidth(480),
 			container.NewPadded(card),
 		),
 	)))
@@ -650,11 +923,11 @@ func (ui *LocalVaultUI) buildVaultKeySettings() fyne.CanvasObject {
 			fyne.TextAlignLeading, fyne.TextStyle{})
 		statusLbl.Importance = widget.SuccessImportance
 
-		changeBtn := widget.NewButtonWithIcon("Change Vault Key", theme.SettingsIcon(), func() {
+		changeBtn := makeSecondaryBtn("Change Vault Key", theme.SettingsIcon(), func() {
 			ui.showSetVaultKeyDialog(true)
 		})
 
-		removeBtn := widget.NewButtonWithIcon("Remove Vault Key", theme.DeleteIcon(), func() {
+		removeBtn := makeDangerBtn("Remove Vault Key", theme.DeleteIcon(), func() {
 			dialog.ShowConfirm("Remove Vault Key",
 				"Remove the vault access key? Users will no longer need it after login.",
 				func(ok bool) {
@@ -669,20 +942,15 @@ func (ui *LocalVaultUI) buildVaultKeySettings() fyne.CanvasObject {
 					ui.showSettings()
 				}, ui.window)
 		})
-		removeBtn.Importance = widget.DangerImportance
 
 		return container.NewVBox(statusLbl, changeBtn, removeBtn)
 	}
 
-	statusLbl := widget.NewLabelWithStyle(
-		"No key set — anyone who logs in can access secrets",
-		fyne.TextAlignLeading, fyne.TextStyle{})
-	statusLbl.Importance = widget.LowImportance
+	statusLbl := makeMutedLabel("No key set — anyone who logs in can access secrets")
 
-	setBtn := widget.NewButtonWithIcon("Set Vault Key", theme.ContentAddIcon(), func() {
+	setBtn := makePrimaryBtn("Set Vault Key", theme.ContentAddIcon(), func() {
 		ui.showSetVaultKeyDialog(false)
 	})
-	setBtn.Importance = widget.HighImportance
 
 	return container.NewVBox(statusLbl, setBtn)
 }
@@ -774,7 +1042,7 @@ func (ui *LocalVaultUI) showMainScreen() {
 	tamperBanner.Importance = widget.DangerImportance
 	tamperBanner.Hide()
 
-	// Single combined ticker: session timeouts + tamper detection (was two goroutines).
+	// Session timeout ticker (60 s): inactivity + absolute session limit.
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
@@ -786,7 +1054,6 @@ func (ui *LocalVaultUI) showMainScreen() {
 				if !ui.vault.Vault.IsUnlocked() {
 					return
 				}
-				// Re-read policy on every tick so admin changes apply immediately.
 				inactivityTimeout := 15 * time.Minute
 				sessionTimeout := time.Duration(0)
 				if policy, pErr := ui.vault.GetSecurityPolicy(); pErr == nil && policy != nil {
@@ -797,7 +1064,6 @@ func (ui *LocalVaultUI) showMainScreen() {
 						sessionTimeout = time.Duration(policy.SessionTimeoutMins) * time.Minute
 					}
 				}
-				// Absolute session timeout (wall-clock since login)
 				if sessionTimeout > 0 && time.Since(sessionStart) >= sessionTimeout {
 					_ = ui.vault.Logout()
 					ui.app.SendNotification(&fyne.Notification{
@@ -808,7 +1074,6 @@ func (ui *LocalVaultUI) showMainScreen() {
 					ui.showLandingScreen()
 					return
 				}
-				// Inactivity timeout (idle since last action)
 				ui.activityMu.RLock()
 				last := ui.lastActivity
 				ui.activityMu.RUnlock()
@@ -822,7 +1087,22 @@ func (ui *LocalVaultUI) showMainScreen() {
 					ui.showLandingScreen()
 					return
 				}
-				// Tamper detection (merged from separate 5s goroutine)
+			}
+		}
+	}()
+
+	// Tamper detection ticker (10 s): separate goroutine for fast response.
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-cancelCh:
+				return
+			case <-ticker.C:
+				if !ui.vault.Vault.IsUnlocked() {
+					return
+				}
 				if ui.vault.CheckVaultTampered() {
 					tamperBanner.Show()
 					tamperBanner.Refresh()
@@ -842,116 +1122,192 @@ func (ui *LocalVaultUI) showMainScreen() {
 	}()
 
 	mainLayout := container.NewBorder(
-		container.NewPadded(tamperBanner), nil, nil, nil,
+		tamperBanner, nil, nil, nil,
 		split,
 	)
 	ui.window.SetContent(ui.withFooter(mainLayout))
+
+	// ── Keyboard shortcuts ────────────────────────────────────────────────────
+	// Re-registered each login so the handler closure captures the current
+	// session's cancel channel. Fyne stores shortcuts in a map keyed by name,
+	// so re-adding the same key overwrites the handler without duplicating it.
+	ui.window.Canvas().AddShortcut(
+		&desktop.CustomShortcut{KeyName: fyne.KeyName("l"), Modifier: desktop.ControlModifier},
+		func(_ fyne.Shortcut) {
+			if !ui.vault.Vault.IsUnlocked() {
+				return
+			}
+			dialog.ShowConfirm("Lock Vault", "Lock the vault and log out?",
+				func(ok bool) {
+					if !ok {
+						return
+					}
+					ui.formDirty = false
+					_ = ui.vault.Logout()
+					ui.currentUser = ""
+					ui.showLandingScreen()
+				}, ui.window)
+		},
+	)
+	ui.window.Canvas().AddShortcut(
+		&desktop.CustomShortcut{KeyName: fyne.KeyName("n"), Modifier: desktop.ControlModifier},
+		func(_ fyne.Shortcut) {
+			if !ui.vault.Vault.IsUnlocked() {
+				return
+			}
+			ui.guardNavigation(func() { ui.showAddSecret() })
+		},
+	)
+	ui.window.Canvas().AddShortcut(
+		&desktop.CustomShortcut{KeyName: fyne.KeyName("f"), Modifier: desktop.ControlModifier},
+		func(_ fyne.Shortcut) {
+			if !ui.vault.Vault.IsUnlocked() {
+				return
+			}
+			ui.guardNavigation(func() { ui.showSearch() })
+		},
+	)
+	ui.window.Canvas().AddShortcut(
+		&desktop.CustomShortcut{KeyName: fyne.KeyName("k"), Modifier: desktop.ControlModifier},
+		func(_ fyne.Shortcut) {
+			if !ui.vault.Vault.IsUnlocked() {
+				return
+			}
+			ui.guardNavigation(func() { ui.showSettings() })
+		},
+	)
 }
 
 // createSidebar creates the navigation sidebar
 func (ui *LocalVaultUI) createSidebar() fyne.CanvasObject {
 	// ── App header ────────────────────────────────────────────────────────────
-	appIcon := widget.NewIcon(theme.StorageIcon())
-	appTitle := widget.NewLabelWithStyle("Password Manager", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	appVersion := widget.NewLabelWithStyle("v1.0", fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
-	appVersion.Importance = widget.LowImportance
-	appHeader := container.NewHBox(
-		appIcon,
-		container.NewVBox(appTitle, appVersion),
-	)
-
-	// ── User avatar ───────────────────────────────────────────────────────────
-	initial := "?"
-	if len(ui.currentUser) > 0 {
-		r := []rune(ui.currentUser)
-		initial = strings.ToUpper(string(r[0:1]))
+	var logoObj fyne.CanvasObject
+	if AppIcon != nil {
+		img := canvas.NewImageFromResource(AppIcon)
+		img.SetMinSize(fyne.NewSize(48, 48))
+		img.FillMode = canvas.ImageFillContain
+		logoObj = container.NewCenter(img)
+	} else {
+		logoObj = container.NewCenter(widget.NewIcon(theme.DocumentIcon()))
 	}
-	avatarBg := canvas.NewRectangle(accentColor())
-	avatarBg.CornerRadius = 20
-	avatarBg.SetMinSize(fyne.NewSize(40, 40))
-	avatarText := canvas.NewText(initial, color.White)
-	avatarText.TextSize = 17
-	avatarText.TextStyle = fyne.TextStyle{Bold: true}
-	avatarText.Alignment = fyne.TextAlignCenter
-	avatar := container.NewStack(avatarBg, container.NewCenter(avatarText))
+	appTitle := widget.NewLabelWithStyle("Password Manager", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	appVersion := widget.NewLabelWithStyle("v"+AppVersion, fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
+	appVersion.Importance = widget.LowImportance
+	appHeader := container.NewVBox(
+		logoObj,
+		appTitle,
+		appVersion,
+	)
 
 	userLabel := widget.NewLabelWithStyle(ui.currentUser, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	roleLabel := widget.NewLabelWithStyle(ui.vault.GetRole(), fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
 	roleLabel.Importance = widget.LowImportance
 	userCard := container.NewHBox(
-		avatar,
 		container.NewVBox(userLabel, roleLabel),
 	)
 
-	// ── Nav button helpers ────────────────────────────────────────────────────
+	// ── Nav item helpers ──────────────────────────────────────────────────────
 	var (
-		secretsBtn  *widget.Button
-		addBtn      *widget.Button
-		searchBtn   *widget.Button
-		settingsBtn *widget.Button
-		adminBtn    *widget.Button
+		secretsNav  *sidebarNavItem
+		addNav      *sidebarNavItem
+		searchNav   *sidebarNavItem
+		healthNav   *sidebarNavItem
+		settingsNav *sidebarNavItem
+		adminNav    *sidebarNavItem
 	)
-	allNavBtns := func() []*widget.Button {
-		btns := []*widget.Button{secretsBtn, addBtn, searchBtn, settingsBtn, adminBtn}
-		var result []*widget.Button
-		for _, b := range btns {
-			if b != nil {
-				result = append(result, b)
+
+	allNavItems := func() []*sidebarNavItem {
+		all := []*sidebarNavItem{secretsNav, addNav, searchNav, healthNav, settingsNav, adminNav}
+		var result []*sidebarNavItem
+		for _, it := range all {
+			if it != nil {
+				result = append(result, it)
 			}
 		}
 		return result
 	}
-	setActive := func(active *widget.Button) {
-		for _, b := range allNavBtns() {
-			if b == active {
-				b.Importance = widget.HighImportance
+
+	setActive := func(active *sidebarNavItem) {
+		for _, it := range allNavItems() {
+			if it == active {
+				it.bar.Show()
+				it.btn.Importance = widget.MediumImportance
 			} else {
-				b.Importance = widget.LowImportance
+				it.bar.Hide()
+				it.btn.Importance = widget.LowImportance
 			}
-			b.Refresh()
+			it.btn.Refresh()
+			it.bar.Refresh()
 		}
 	}
 
-	// ── Nav buttons ───────────────────────────────────────────────────────────
-	secretsBtn = widget.NewButtonWithIcon("  Secrets", theme.ListIcon(), func() {
-		setActive(secretsBtn)
-		ui.showSecretsList()
-	})
-	secretsBtn.Alignment = widget.ButtonAlignLeading
-	secretsBtn.Importance = widget.HighImportance
+	makeNavItem := func(label string, icon fyne.Resource, fn func()) *sidebarNavItem {
+		btn := widget.NewButtonWithIcon("  "+label, icon, nil)
+		btn.Alignment = widget.ButtonAlignLeading
+		btn.Importance = widget.LowImportance
+		bar := canvas.NewRectangle(accentColor())
+		bar.SetMinSize(fyne.NewSize(3, 0))
+		bar.Hide()
+		wrap := container.NewBorder(nil, nil, bar, nil, btn)
+		btn.OnTapped = fn
+		return &sidebarNavItem{btn: btn, bar: bar, wrap: wrap}
+	}
 
-	addBtn = widget.NewButtonWithIcon("  Add Secret", theme.ContentAddIcon(), func() {
-		setActive(addBtn)
-		ui.showAddSecret()
+	// ── Nav items ─────────────────────────────────────────────────────────────
+	secretsNav = makeNavItem("Secrets", theme.ListIcon(), func() {
+		ui.guardNavigation(func() {
+			setActive(secretsNav)
+			ui.showSecretsList()
+		})
 	})
-	addBtn.Alignment = widget.ButtonAlignLeading
-	addBtn.Importance = widget.LowImportance
 
-	searchBtn = widget.NewButtonWithIcon("  Search", theme.SearchIcon(), func() {
-		setActive(searchBtn)
-		ui.showSearch()
+	addNav = makeNavItem("Add Secret", theme.ContentAddIcon(), func() {
+		ui.guardNavigation(func() {
+			setActive(addNav)
+			ui.showAddSecret()
+		})
 	})
-	searchBtn.Alignment = widget.ButtonAlignLeading
-	searchBtn.Importance = widget.LowImportance
 
-	settingsBtn = widget.NewButtonWithIcon("  Settings", theme.SettingsIcon(), func() {
-		setActive(settingsBtn)
-		ui.showSettings()
+	searchNav = makeNavItem("Search", theme.SearchIcon(), func() {
+		ui.guardNavigation(func() {
+			setActive(searchNav)
+			ui.showSearch()
+		})
 	})
-	settingsBtn.Alignment = widget.ButtonAlignLeading
-	settingsBtn.Importance = widget.LowImportance
+
+	healthNav = makeNavItem("Vault Health", theme.WarningIcon(), func() {
+		ui.guardNavigation(func() {
+			setActive(healthNav)
+			ui.showVaultHealth()
+		})
+	})
+
+	settingsNav = makeNavItem("Settings", theme.SettingsIcon(), func() {
+		ui.guardNavigation(func() {
+			setActive(settingsNav)
+			ui.showSettings()
+		})
+	})
+
+	// Secrets is the default active item on load.
+	secretsNav.bar.Show()
+	secretsNav.btn.Importance = widget.MediumImportance
 
 	lockBtn := widget.NewButtonWithIcon("  Lock Vault", theme.LogoutIcon(), func() {
-		dialog.ShowConfirm("Lock Vault",
-			"Lock the vault and return to the login screen?",
-			func(ok bool) {
-				if !ok {
+		dialog.ShowConfirm(
+			"Log Out",
+			"Are you sure you want to log out?",
+			func(confirmed bool) {
+				if !confirmed {
 					return
 				}
+				ui.formDirty = false
 				_ = ui.vault.Logout()
 				ui.currentUser = ""
 				ui.showLandingScreen()
-			}, ui.window)
+			},
+			ui.window,
+		)
 	})
 	lockBtn.Importance = widget.DangerImportance
 	lockBtn.Alignment = widget.ButtonAlignLeading
@@ -966,38 +1322,46 @@ func (ui *LocalVaultUI) createSidebar() fyne.CanvasObject {
 		widget.NewSeparator(),
 		container.NewPadded(userCard),
 		widget.NewSeparator(),
-		secretsBtn,
+		secretsNav.wrap,
 	}
 
 	if hasPerm(auth.CanCreateSecret) {
-		navItems = append(navItems, addBtn)
+		navItems = append(navItems, addNav.wrap)
 	}
 	if hasPerm(auth.CanViewSecrets) {
-		navItems = append(navItems, searchBtn)
+		navItems = append(navItems, searchNav.wrap)
+		navItems = append(navItems, healthNav.wrap)
 	}
 
 	navItems = append(navItems,
 		widget.NewSeparator(),
-		settingsBtn,
+		settingsNav.wrap,
 	)
 
 	if hasPerm(auth.CanViewUsers) || hasPerm(auth.CanViewAuditLogs) || hasPerm(auth.CanManagePolicy) || hasPerm(auth.CanManageSessions) || hasPerm(auth.CanExportData) {
-		adminBtn = widget.NewButtonWithIcon("  Admin Dashboard", theme.GridIcon(), func() {
-			setActive(adminBtn)
-			ui.showAdminDashboard()
+		adminNav = makeNavItem("Admin Dashboard", theme.GridIcon(), func() {
+			ui.guardNavigation(func() {
+				setActive(adminNav)
+				ui.showAdminDashboard()
+			})
 		})
-		adminBtn.Alignment = widget.ButtonAlignLeading
-		adminBtn.Importance = widget.LowImportance
-		navItems = append(navItems, widget.NewSeparator(), adminBtn)
+		navItems = append(navItems, widget.NewSeparator(), adminNav.wrap)
 	}
 
-	aboutBtn := widget.NewButtonWithIcon("  About", theme.InfoIcon(), func() {
-		ui.showAboutDialog()
+	// About nav item — loads in content pane like all other destinations.
+	aboutNavItem := makeNavItem("About", theme.InfoIcon(), func() {
+		ui.guardNavigation(func() {
+			setActive(nil) // deactivate all core nav items
+			ui.showAbout()
+		})
 	})
-	aboutBtn.Alignment = widget.ButtonAlignLeading
-	aboutBtn.Importance = widget.LowImportance
 
-	navItems = append(navItems, layout.NewSpacer(), widget.NewSeparator(), aboutBtn, lockBtn)
+	navItems = append(navItems,
+		layout.NewSpacer(),
+		widget.NewSeparator(),
+		aboutNavItem.wrap,
+		lockBtn,
+	)
 
 	sidebarContent := container.NewPadded(container.NewVBox(navItems...))
 
@@ -1005,7 +1369,7 @@ func (ui *LocalVaultUI) createSidebar() fyne.CanvasObject {
 	return container.NewStack(bg, sidebarContent)
 }
 
-// showSecretsList shows the list of secrets
+// showSecretsList shows the list of secrets with live search and category filter chips.
 func (ui *LocalVaultUI) showSecretsList() {
 	ui.resetActivity()
 	secrets, err := ui.vault.ListSecrets()
@@ -1015,56 +1379,93 @@ func (ui *LocalVaultUI) showSecretsList() {
 	}
 
 	// Filter out system entries
-	var filteredSecrets []*vault.SecretData
+	var allSecrets []*vault.SecretData
 	for _, s := range secrets {
 		if s.Category != "__SYSTEM__" {
-			filteredSecrets = append(filteredSecrets, s)
+			allSecrets = append(allSecrets, s)
 		}
 	}
 
-	title := widget.NewLabelWithStyle("Your Secrets", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	countLabel := widget.NewLabel(fmt.Sprintf("%d secrets stored", len(filteredSecrets)))
-	countLabel.Importance = widget.LowImportance
-
-	addSecretBtn := widget.NewButtonWithIcon("+ Add Secret", theme.ContentAddIcon(), func() {
+	addSecretBtn := makeLowBtn("+ Add Secret", nil, func() {
 		ui.showAddSecret()
 	})
-	addSecretBtn.Importance = widget.HighImportance
 
-	pageHeader := container.NewPadded(container.NewVBox(
-		container.NewHBox(title, layout.NewSpacer(), addSecretBtn),
-		countLabel,
-		widget.NewSeparator(),
-	))
+	pageHeader := makePageHeader(
+		"Your Secrets",
+		fmt.Sprintf("%d secrets stored", len(allSecrets)),
+		addSecretBtn,
+	)
 
-	if len(filteredSecrets) == 0 {
-		emptyTitle := widget.NewLabelWithStyle("No Secrets Yet", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-		emptyDesc := widget.NewLabelWithStyle(
-			"Use the '+ Add Secret' button above to create your first secure entry.",
-			fyne.TextAlignCenter, fyne.TextStyle{},
-		)
-		emptyDesc.Importance = widget.LowImportance
-		addFirstBtn := widget.NewButtonWithIcon("Create First Secret", theme.ContentAddIcon(), func() {
+	if len(allSecrets) == 0 {
+		emptyIcon := widget.NewIcon(theme.ContentAddIcon())
+		emptyTitle := widget.NewLabelWithStyle("Your vault is empty", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		emptyDesc := makeMutedLabel("Click \"Add Secret\" to store your first password, API key, or other credential.")
+		emptyDesc.Alignment = fyne.TextAlignCenter
+		emptyDesc.Wrapping = fyne.TextWrapWord
+		addFirstBtn := makePrimaryBtn("Add Your First Secret", theme.ContentAddIcon(), func() {
 			ui.showAddSecret()
 		})
-		addFirstBtn.Importance = widget.HighImportance
-
-		emptyCard := widget.NewCard("Vault is empty", "Securely store passwords, API keys, and more", container.NewVBox(
-			container.NewPadded(container.NewVBox(emptyTitle, emptyDesc)),
+		emptyState := container.NewCenter(container.NewVBox(
+			container.NewCenter(emptyIcon),
+			container.NewPadded(emptyTitle),
+			container.NewPadded(emptyDesc),
+			widget.NewSeparator(),
 			container.NewCenter(addFirstBtn),
 		))
-
 		ui.content.Objects = []fyne.CanvasObject{
-			container.NewBorder(pageHeader, nil, nil, nil,
-				container.NewCenter(container.NewPadded(emptyCard)),
-			),
+			container.NewBorder(pageHeader, nil, nil, nil, emptyState),
 		}
 		ui.content.Refresh()
 		return
 	}
 
-	// List rows: [0]=icon  [1]=VBox(name,user)  [2]=spacer  [3]=Stack(pill,catLabel)
-	list := widget.NewList(
+	// Collect unique categories for the filter chip row
+	catSet := map[string]struct{}{}
+	for _, s := range allSecrets {
+		cat := s.Category
+		if cat == "" {
+			cat = "uncategorised"
+		}
+		catSet[cat] = struct{}{}
+	}
+	var categories []string
+	for c := range catSet {
+		categories = append(categories, c)
+	}
+	sort.Strings(categories)
+
+	// filteredSecrets is closed over by the list callbacks and applyFilter.
+	filteredSecrets := allSecrets
+	var activeFilter string
+	var searchQuery string
+
+	// Forward-declare list so applyFilter can call list.Refresh().
+	var list *widget.List
+
+	applyFilter := func() {
+		var out []*vault.SecretData
+		q := strings.ToLower(searchQuery)
+		for _, s := range allSecrets {
+			cat := s.Category
+			if cat == "" {
+				cat = "uncategorised"
+			}
+			if activeFilter != "" && cat != activeFilter {
+				continue
+			}
+			if q != "" &&
+				!strings.Contains(strings.ToLower(s.Name), q) &&
+				!strings.Contains(strings.ToLower(s.Username), q) {
+				continue
+			}
+			out = append(out, s)
+		}
+		filteredSecrets = out
+		list.Refresh()
+	}
+
+	// List rows: [0]=minH  [1]=HBox([0]=accent [1]=Center(icon) [2]=VBox(name,user) [3]=spacer [4]=Center(catBadge))
+	list = widget.NewList(
 		func() int { return len(filteredSecrets) },
 		func() fyne.CanvasObject {
 			nameLabel := widget.NewLabelWithStyle("Secret Name", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
@@ -1072,15 +1473,18 @@ func (ui *LocalVaultUI) showSecretsList() {
 			userLabel.Importance = widget.LowImportance
 			catLabel := widget.NewLabel("category")
 			catLabel.Importance = widget.LowImportance
-			pill := canvas.NewRectangle(color.RGBA{R: 47, G: 129, B: 247, A: 40})
-			pill.CornerRadius = 10
+			pill := canvas.NewRectangle(categoryColor("uncategorised"))
+			pill.CornerRadius = 8
 			catBadge := container.NewStack(pill, container.NewPadded(catLabel))
+			accent := canvas.NewRectangle(accentColor())
+			accent.SetMinSize(fyne.NewSize(3, 0))
 			minH := canvas.NewRectangle(color.Transparent)
-			minH.SetMinSize(fyne.NewSize(0, 48))
+			minH.SetMinSize(fyne.NewSize(0, 28))
 			return container.NewStack(
 				minH,
 				container.NewHBox(
-					container.NewCenter(widget.NewIcon(theme.DocumentIcon())),
+					accent,
+					container.NewCenter(widget.NewIcon(theme.AccountIcon())),
 					container.NewVBox(nameLabel, userLabel),
 					layout.NewSpacer(),
 					container.NewCenter(catBadge),
@@ -1092,13 +1496,38 @@ func (ui *LocalVaultUI) showSecretsList() {
 				return
 			}
 			secret := filteredSecrets[i]
-			outer := o.(*fyne.Container) // Stack(minH, HBox)
-			row := outer.Objects[1].(*fyne.Container) // HBox
 
-			// [1] = VBox(nameLabel, userLabel)
-			centre := row.Objects[1].(*fyne.Container)
-			centre.Objects[0].(*widget.Label).SetText(secret.Name)
+			outer, ok := o.(*fyne.Container)
+			if !ok || len(outer.Objects) < 2 {
+				return
+			}
+			// HBox: [0]=accent [1]=Center(icon) [2]=VBox(name,user) [3]=spacer [4]=Center(catBadge)
+			row, ok := outer.Objects[1].(*fyne.Container)
+			if !ok || len(row.Objects) < 5 {
+				return
+			}
+			iconCenter, ok := row.Objects[1].(*fyne.Container)
+			if !ok || len(iconCenter.Objects) < 1 {
+				return
+			}
+			iconWidget, ok := iconCenter.Objects[0].(*widget.Icon)
+			if !ok {
+				return
+			}
+			centre, ok := row.Objects[2].(*fyne.Container)
+			if !ok || len(centre.Objects) < 2 {
+				return
+			}
+			nameLabel, ok := centre.Objects[0].(*widget.Label)
+			if !ok {
+				return
+			}
+			userLabel, ok := centre.Objects[1].(*widget.Label)
+			if !ok {
+				return
+			}
 
+			nameLabel.SetText(secret.Name)
 			userHint := secret.Username
 			if userHint == "" {
 				userHint = secret.URL
@@ -1106,32 +1535,76 @@ func (ui *LocalVaultUI) showSecretsList() {
 			if userHint == "" {
 				userHint = "no username"
 			}
-			centre.Objects[1].(*widget.Label).SetText(userHint)
+			userLabel.SetText(userHint)
 
-			// [3] = Center(Stack(pill, Padded(catLabel)))
-			centeredBadge := row.Objects[3].(*fyne.Container)
-			badge := centeredBadge.Objects[0].(*fyne.Container)
-			padded := badge.Objects[1].(*fyne.Container)
 			cat := secret.Category
 			if cat == "" {
 				cat = "uncategorised"
 			}
-			padded.Objects[0].(*widget.Label).SetText(cat)
+			iconWidget.SetResource(categoryIcon(cat))
+
+			centeredBadge, ok := row.Objects[4].(*fyne.Container)
+			if !ok || len(centeredBadge.Objects) < 1 {
+				return
+			}
+			badge, ok := centeredBadge.Objects[0].(*fyne.Container)
+			if !ok || len(badge.Objects) < 2 {
+				return
+			}
+			pill, ok := badge.Objects[0].(*canvas.Rectangle)
+			if !ok {
+				return
+			}
+			padded, ok := badge.Objects[1].(*fyne.Container)
+			if !ok || len(padded.Objects) < 1 {
+				return
+			}
+			catLabel, ok := padded.Objects[0].(*widget.Label)
+			if !ok {
+				return
+			}
+			col := categoryColor(cat)
+			pill.FillColor = col
+			pill.Refresh()
+			catLabel.SetText(cat)
 		},
 	)
 
 	list.OnSelected = func(id widget.ListItemID) {
-		ui.showSecretDetails(filteredSecrets[id])
+		if id < len(filteredSecrets) {
+			ui.detailBack = ui.showSecretsList
+			ui.showSecretDetails(filteredSecrets[id])
+		}
 		list.UnselectAll()
 	}
 
+	searchBar := makeSearchBar("Search by name or username…", func(q string) {
+		searchQuery = q
+		applyFilter()
+	})
+
+	categoryRow := makeCategoryFilterRow(categories, func(cat string) {
+		activeFilter = cat
+		applyFilter()
+	})
+
+	toolbar := container.NewPadded(container.NewVBox(
+		searchBar,
+		categoryRow,
+		widget.NewSeparator(),
+	))
+
 	ui.content.Objects = []fyne.CanvasObject{
-		container.NewBorder(pageHeader, nil, nil, nil, list),
+		container.NewBorder(
+			container.NewVBox(pageHeader, toolbar),
+			nil, nil, nil,
+			list,
+		),
 	}
 	ui.content.Refresh()
 }
 
-// showSecretDetails shows details of a secret
+// showSecretDetails shows details of a secret with reveal toggle and copy rows.
 func (ui *LocalVaultUI) showSecretDetails(secret *vault.SecretData) {
 	ui.resetActivity()
 	// Fetch full decrypted secret via audited call — the list may contain scrubbed entries.
@@ -1141,108 +1614,118 @@ func (ui *LocalVaultUI) showSecretDetails(secret *vault.SecretData) {
 		return
 	}
 	secret = full
-	title := widget.NewLabelWithStyle(secret.Name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 
-	// Fields
-	usernameEntry := widget.NewEntry()
-	usernameEntry.SetText(secret.Username)
-	usernameEntry.Disable()
+	// ── Header ────────────────────────────────────────────────────────────────
+	versionCount := len(secret.PasswordHistory) + 1
+	metaLine := widget.NewLabelWithStyle(
+		fmt.Sprintf("Created: %s  ·  Updated: %s  ·  Versions: %d",
+			secret.CreatedAt.Format("2006-01-02"),
+			secret.UpdatedAt.Format("2006-01-02 15:04"),
+			versionCount,
+		),
+		fyne.TextAlignLeading, fyne.TextStyle{Italic: true},
+	)
+	metaLine.Importance = widget.LowImportance
 
-	passwordEntry := widget.NewPasswordEntry()
-	passwordEntry.SetText(secret.Password)
-	passwordEntry.Disable()
+	// ── Copy helpers ──────────────────────────────────────────────────────────
+	doCopy := func(value, label string) {
+		if ui.vault.HasPermission(auth.CanCopySecret) {
+			_ = ui.clipboardManager.CopyToClipboard(value)
+			ui.showNotification(label + " copied (auto-clears in 30s)")
+		}
+	}
 
-	urlEntry := widget.NewEntry()
-	urlEntry.SetText(secret.URL)
-	urlEntry.Disable()
+	// ── Password reveal toggle ────────────────────────────────────────────────
+	pwEntry := widget.NewEntry()
+	pwEntry.SetText(secret.Password)
+	pwEntry.Password = true
+	pwEntry.Disable()
 
-	notesEntry := widget.NewMultiLineEntry()
-	notesEntry.SetText(secret.Notes)
-	notesEntry.Disable()
+	var revealBtn *widget.Button
+	revealed := false
+	revealBtn = widget.NewButtonWithIcon("", theme.VisibilityIcon(), func() {
+		revealed = !revealed
+		pwEntry.Password = !revealed
+		if revealed {
+			revealBtn.SetIcon(theme.VisibilityOffIcon())
+		} else {
+			revealBtn.SetIcon(theme.VisibilityIcon())
+		}
+		pwEntry.Refresh()
+	})
+	revealBtn.Importance = widget.LowImportance
 
+	copyPwBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {
+		doCopy(secret.Password, "Password")
+	})
+	copyPwBtn.Importance = widget.LowImportance
+	if !ui.vault.HasPermission(auth.CanCopySecret) {
+		copyPwBtn.Disable()
+	}
+
+	pwRow := makeFormRow("Password",
+		container.NewBorder(nil, nil, nil,
+			container.NewHBox(revealBtn, copyPwBtn),
+			pwEntry,
+		),
+	)
+
+	// ── Username row ──────────────────────────────────────────────────────────
+	copyUserBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {
+		doCopy(secret.Username, "Username")
+	})
+	copyUserBtn.Importance = widget.LowImportance
+	if !ui.vault.HasPermission(auth.CanCopySecret) || secret.Username == "" {
+		copyUserBtn.Disable()
+	}
+	userEntry := widget.NewEntry()
+	userEntry.SetText(secret.Username)
+	userEntry.Disable()
+	userRow := makeFormRow("Username",
+		container.NewBorder(nil, nil, nil, copyUserBtn, userEntry),
+	)
+
+	// ── URL row — only shown when the secret has a URL ───────────────────────
+	var urlRow fyne.CanvasObject
+	if secret.URL != "" {
+		urlEntry := widget.NewEntry()
+		urlEntry.SetText(secret.URL)
+		urlEntry.Disable()
+		urlRow = makeFormRow("URL", urlEntry)
+	}
+
+	// ── Category / Tags ───────────────────────────────────────────────────────
 	cat := secret.Category
 	if cat == "" {
 		cat = "uncategorised"
 	}
-	categoryLabel := widget.NewLabel(cat)
-	categoryLabel.Importance = widget.LowImportance
-
-	var tagsStr string
+	tagsStr := "—"
 	if len(secret.Tags) > 0 {
 		tagsStr = strings.Join(secret.Tags, ", ")
-	} else {
-		tagsStr = "—"
-	}
-	tagsLabel := widget.NewLabel(tagsStr)
-	tagsLabel.Importance = widget.LowImportance
-
-	// Action buttons
-	var copyUserBtn, copyPassBtn *widget.Button
-	if ui.vault.HasPermission(auth.CanCopySecret) {
-		copyUserBtn = widget.NewButtonWithIcon("Copy Username", theme.ContentCopyIcon(), func() {
-			if ui.clipboardManager != nil {
-				_ = ui.clipboardManager.CopyToClipboard(secret.Username)
-			} else {
-				ui.window.Clipboard().SetContent(secret.Username)
-			}
-			ui.showNotification("Username copied (auto-clears in 30s)")
-		})
-
-		copyPassBtn = widget.NewButtonWithIcon("Copy Password", theme.ContentCopyIcon(), func() {
-			if ui.clipboardManager != nil {
-				_ = ui.clipboardManager.CopyToClipboard(secret.Password)
-			} else {
-				ui.window.Clipboard().SetContent(secret.Password)
-			}
-			ui.showNotification("Password copied (auto-clears in 30s)")
-		})
-	} else {
-		// Disabled placeholders to preserve layout when copying is not permitted
-		copyUserBtn = widget.NewButtonWithIcon("Copy Username", theme.ContentCopyIcon(), nil)
-		copyUserBtn.Disable()
-		copyPassBtn = widget.NewButtonWithIcon("Copy Password", theme.ContentCopyIcon(), nil)
-		copyPassBtn.Disable()
 	}
 
-	editBtn := widget.NewButtonWithIcon("Edit", theme.DocumentCreateIcon(), func() {
-		ui.showEditSecret(secret)
-	})
+	credItems := []fyne.CanvasObject{
+		container.NewPadded(userRow),
+		container.NewPadded(pwRow),
+	}
+	if urlRow != nil {
+		credItems = append(credItems, container.NewPadded(urlRow))
+	}
+	credCard := widget.NewCard("Credentials", "", container.NewVBox(credItems...))
 
-	deleteBtn := widget.NewButtonWithIcon("Delete", theme.DeleteIcon(), func() {
-		dialog.ShowConfirm("Delete Secret",
-			fmt.Sprintf("Are you sure you want to delete '%s'?", secret.Name),
-			func(ok bool) {
-				if ok {
-					if err := ui.vault.DeleteSecretAudited(secret.ID); err != nil {
-						ui.showError("Failed to delete", err)
-					} else {
-						ui.showSecretsList()
-					}
-				}
-			}, ui.window)
-	})
-	deleteBtn.Importance = widget.DangerImportance
+	metaItems := []fyne.CanvasObject{
+		container.NewPadded(makeInfoRow(theme.ListIcon(), "Category", cat)),
+		container.NewPadded(makeInfoRow(theme.MenuIcon(), "Tags", tagsStr)),
+	}
+	if secret.Notes != "" {
+		notesEntry := widget.NewMultiLineEntry()
+		notesEntry.SetText(secret.Notes)
+		notesEntry.Disable()
+		metaItems = append(metaItems, widget.NewSeparator(), container.NewPadded(notesEntry))
+	}
+	metaCard := widget.NewCard("Details", "", container.NewVBox(metaItems...))
 
-	backBtn := widget.NewButtonWithIcon("Back", theme.NavigateBackIcon(), func() {
-		ui.showSecretsList()
-	})
-
-	historyBtn := widget.NewButtonWithIcon("History", theme.HistoryIcon(), func() {
-		ui.showPasswordHistory(secret)
-	})
-
-	shareBtn := widget.NewButtonWithIcon("Share", theme.AccountIcon(), func() {
-		ui.showShareSecretDialog(secret)
-	})
-
-	// ── Permission-gated action bar ──────────────────────────────────────────
-	// Determine what the current user may do on this secret.
-	//
-	// Rules:
-	//  1. The user's ROLE defines the ceiling (ReadOnly cannot edit/delete).
-	//  2. For shared secrets (the user is a grantee, not the owner) the
-	//     per-secret grant flags provide an additional restriction.
-	//  3. Only the secret owner may manage sharing.
+	// ── Permission-gated action buttons ───────────────────────────────────────
 	role := ui.vault.GetRole()
 	rolePerms, _ := auth.GetRolePermissions(role)
 	hasRolePerm := func(p string) bool {
@@ -1256,7 +1739,6 @@ func (ui *LocalVaultUI) showSecretDetails(secret *vault.SecretData) {
 
 	sm := vault.NewSharedCredentialManager(ui.vault)
 	owner := sm.GetOwner(secret.ID)
-	// If no explicit share metadata exists, fall back to the CreatedBy owner field.
 	if owner == "" {
 		owner = secret.CreatedBy
 	}
@@ -1264,11 +1746,7 @@ func (ui *LocalVaultUI) showSecretDetails(secret *vault.SecretData) {
 
 	canEdit := hasRolePerm(auth.CanEditSecret)
 	canDelete := hasRolePerm(auth.CanDeleteSecret)
-
 	if !isOwner {
-		// Grantee path: the per-secret share grant overrides the role ceiling.
-		// A read_only user explicitly granted CanUpdate or CanDelete on this
-		// specific secret should see those buttons — the grant is intentional.
 		access := sm.GetGranteeAccess(secret.ID, ui.currentUser)
 		if access != nil {
 			canEdit = access.CanUpdate
@@ -1278,73 +1756,64 @@ func (ui *LocalVaultUI) showSecretDetails(secret *vault.SecretData) {
 			canDelete = false
 		}
 	}
-
-	// Only the owner (with edit permission) may share a secret with others.
 	canShare := isOwner && canEdit
 
-	// Build the action row dynamically so no forbidden buttons leak through.
-	actionItems := []fyne.CanvasObject{}
-	// Copy actions only shown when copy permission exists (copy buttons are already disabled when not permitted)
-	actionItems = append(actionItems, copyUserBtn, copyPassBtn)
-	if canEdit {
-		actionItems = append(actionItems, editBtn)
+	// Determine back destination — default to secrets list if not set.
+	backFn := ui.detailBack
+	if backFn == nil {
+		backFn = ui.showSecretsList
 	}
-	// history button only visible to administrators
+	backBtn := makeLowBtn("Back", theme.NavigateBackIcon(), backFn)
+
+	var actionBtns []fyne.CanvasObject
+	actionBtns = append(actionBtns, backBtn)
+	if canEdit {
+		actionBtns = append(actionBtns,
+			makePrimaryBtn("Edit", theme.DocumentCreateIcon(), func() { ui.showEditSecret(secret) }),
+		)
+	}
 	if ui.vault.HasPermission(auth.CanManagePolicy) {
-		actionItems = append(actionItems, historyBtn)
+		actionBtns = append(actionBtns,
+			makeSecondaryBtn("History", theme.HistoryIcon(), func() { ui.showPasswordHistory(secret) }),
+		)
 	}
 	if canShare {
-		actionItems = append(actionItems, shareBtn)
+		actionBtns = append(actionBtns,
+			makeSecondaryBtn("Share", theme.AccountIcon(), func() { ui.showShareSecretDialog(secret) }),
+		)
 	}
 	if canDelete {
-		actionItems = append(actionItems, deleteBtn)
+		actionBtns = append(actionBtns,
+			makeDangerBtn("Delete", theme.DeleteIcon(), func() {
+				dialog.ShowConfirm("Delete Secret",
+					fmt.Sprintf("Are you sure you want to delete '%s'?", secret.Name),
+					func(ok bool) {
+						if ok {
+							if err := ui.vault.DeleteSecretAudited(secret.ID); err != nil {
+								ui.showError("Failed to delete", err)
+							} else {
+								ui.showSecretsList()
+							}
+						}
+					}, ui.window)
+			}),
+		)
 	}
-	actionItems = append(actionItems, layout.NewSpacer(), backBtn)
 
-	// Metadata row — uses only available SecretData fields
-	versionCount := len(secret.PasswordHistory) + 1
-	versionLabel := widget.NewLabelWithStyle(
-		fmt.Sprintf("Created: %s  ·  Updated: %s  ·  Versions: %d",
-			secret.CreatedAt.Format("2006-01-02"),
-			secret.UpdatedAt.Format("2006-01-02 15:04"),
-			versionCount,
-		),
-		fyne.TextAlignLeading, fyne.TextStyle{Italic: true},
-	)
-	versionLabel.Importance = widget.LowImportance
-
-	credCard := widget.NewCard("Credentials", "", container.NewVBox(
-		container.New(layout.NewFormLayout(),
-			widget.NewLabel("Username"), usernameEntry,
-			widget.NewLabel("Password"), passwordEntry,
-			widget.NewLabel("URL"), urlEntry,
-		),
-	))
-
-	var metaItems []fyne.CanvasObject
-	metaItems = append(metaItems,
-		container.New(layout.NewFormLayout(),
-			widget.NewLabel("Category"), categoryLabel,
-			widget.NewLabel("Tags"), tagsLabel,
-		),
-	)
-	if notesEntry.Text != "" {
-		metaItems = append(metaItems, widget.NewSeparator(), widget.NewLabel("Notes"), notesEntry)
+	// Wrap buttons in a grid so they reflow instead of overflowing horizontally
+	// when many actions are visible (e.g. admin with Back+Edit+History+Share+Delete).
+	cols := len(actionBtns)
+	if cols > 3 {
+		cols = 3
 	}
-	metaCard := widget.NewCard("Details", "", container.NewVBox(metaItems...))
-
-	actionBar := container.NewPadded(container.NewHBox(actionItems...))
+	actionGrid := container.NewGridWithColumns(cols, actionBtns...)
 
 	form := container.NewVBox(
-		container.NewPadded(container.NewVBox(
-			title,
-			versionLabel,
-		)),
-		widget.NewSeparator(),
+		makePageHeader(secret.Name, metaLine.Text, nil),
 		container.NewPadded(credCard),
 		container.NewPadded(metaCard),
 		widget.NewSeparator(),
-		actionBar,
+		container.NewPadded(actionGrid),
 	)
 
 	ui.content.Objects = []fyne.CanvasObject{container.NewScroll(form)}
@@ -1360,24 +1829,33 @@ func escapeCSV(s string) string {
 	return s
 }
 
-// showAddSecret shows the add secret form
+// showAddSecret shows the add secret form.
 func (ui *LocalVaultUI) showAddSecret() {
 	ui.resetActivity()
 	if !ui.vault.HasPermission(auth.CanCreateSecret) {
 		ui.showError("Permission denied", fmt.Errorf("missing %s", auth.CanCreateSecret))
 		return
 	}
+
 	nameEntry := widget.NewEntry()
-	nameEntry.SetPlaceHolder("Secret Name")
+	nameEntry.SetPlaceHolder("Required")
 
 	usernameEntry := widget.NewEntry()
-	usernameEntry.SetPlaceHolder("Username")
+	usernameEntry.SetPlaceHolder("Username / email")
 
 	passwordEntry := widget.NewPasswordEntry()
-	passwordEntry.SetPlaceHolder("Password")
+	passwordEntry.SetPlaceHolder("Required")
+
+	generateBtn := makeLowBtn("Generate", theme.ViewRefreshIcon(), func() {
+		if !ui.vault.HasPermission(auth.CanRotateSecret) {
+			ui.showError("Permission denied", fmt.Errorf("missing %s", auth.CanRotateSecret))
+			return
+		}
+		passwordEntry.SetText(generateSecurePassword(20))
+	})
 
 	urlEntry := widget.NewEntry()
-	urlEntry.SetPlaceHolder("URL (optional)")
+	urlEntry.SetPlaceHolder("https://example.com (optional)")
 
 	notesEntry := widget.NewMultiLineEntry()
 	notesEntry.SetPlaceHolder("Notes (optional)")
@@ -1390,47 +1868,37 @@ func (ui *LocalVaultUI) showAddSecret() {
 	categorySelect.SetSelected("login")
 
 	tagsEntry := widget.NewEntry()
-	tagsEntry.SetPlaceHolder("Tags (comma-separated)")
+	tagsEntry.SetPlaceHolder("comma-separated")
 
-	errorLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{})
-	errorLabel.Importance = widget.DangerImportance
+	errorLabel := makeErrorLabel()
 
-	// Generate password button
-	generateBtn := widget.NewButtonWithIcon("Generate", theme.ViewRefreshIcon(), func() {
-		if !ui.vault.HasPermission(auth.CanRotateSecret) {
-			ui.showError("Permission denied", fmt.Errorf("missing %s", auth.CanRotateSecret))
-			return
-		}
-		password := generateSecurePassword(20)
-		passwordEntry.SetText(password)
-	})
+	// Mark form dirty on any field change so nav guard can warn before leaving.
+	markDirty := func(_ string) { ui.formDirty = true }
+	nameEntry.OnChanged = markDirty
+	usernameEntry.OnChanged = markDirty
+	passwordEntry.OnChanged = markDirty
+	urlEntry.OnChanged = markDirty
+	tagsEntry.OnChanged = markDirty
+	notesEntry.OnChanged = markDirty
 
-	saveBtn := widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), func() {
+	doSave := func() {
 		errorLabel.SetText("")
-
 		name := strings.TrimSpace(nameEntry.Text)
 		if name == "" {
 			errorLabel.SetText("Name is required")
 			return
 		}
-
 		password := passwordEntry.Text
 		if password == "" {
 			errorLabel.SetText("Password is required")
 			return
 		}
-
-		// Parse tags
 		var tags []string
-		if tagsEntry.Text != "" {
-			for _, t := range strings.Split(tagsEntry.Text, ",") {
-				t = strings.TrimSpace(t)
-				if t != "" {
-					tags = append(tags, t)
-				}
+		for _, t := range strings.Split(tagsEntry.Text, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				tags = append(tags, t)
 			}
 		}
-
 		secret := &vault.SecretData{
 			Name:     name,
 			Username: strings.TrimSpace(usernameEntry.Text),
@@ -1440,58 +1908,49 @@ func (ui *LocalVaultUI) showAddSecret() {
 			Category: categorySelect.Selected,
 			Tags:     tags,
 		}
-
 		if err := ui.vault.AddSecretAudited(secret); err != nil {
 			errorLabel.SetText(err.Error())
 			return
 		}
-
+		ui.formDirty = false
 		ui.showNotification("Secret saved successfully")
 		ui.showSecretsList()
-	})
-	saveBtn.Importance = widget.HighImportance
-
-	cancelBtn := widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() {
-		ui.showSecretsList()
-	})
-
-	strengthLabel := widget.NewLabelWithStyle("Strength: —", fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
-	strengthLabel.Importance = widget.LowImportance
-	passwordEntry.OnChanged = func(pw string) {
-		label, imp := passwordStrength(pw)
-		strengthLabel.SetText("Strength: " + label)
-		strengthLabel.Importance = imp
-		strengthLabel.Refresh()
 	}
 
+	pwRow := container.NewBorder(nil, nil, nil, generateBtn, makeFullWidthEntry(passwordEntry))
+
 	formCard := widget.NewCard("New Secret", "Fields marked * are required", container.NewVBox(
-		container.New(layout.NewFormLayout(),
-			widget.NewLabel("Name *"), nameEntry,
-			widget.NewLabel("Username"), usernameEntry,
-			widget.NewLabel("Password *"), container.NewBorder(nil, nil, nil, generateBtn, passwordEntry),
-			widget.NewLabel("URL"), urlEntry,
-			widget.NewLabel("Category"), categorySelect,
-			widget.NewLabel("Tags"), tagsEntry,
-		),
-		strengthLabel,
-		widget.NewSeparator(),
-		widget.NewLabel("Notes"),
-		notesEntry,
+		container.NewPadded(makeFormRow("Name *", makeFullWidthEntry(nameEntry))),
+		container.NewPadded(makeFormRow("Username", makeFullWidthEntry(usernameEntry))),
+		container.NewPadded(makeFormRow("Password *", pwRow)),
+		container.NewPadded(makeFormRow("URL", makeFullWidthEntry(urlEntry))),
+		container.NewPadded(makeFormRow("Category", categorySelect)),
+		container.NewPadded(makeFormRow("Tags", makeFullWidthEntry(tagsEntry))),
+		makeDivider(),
+		container.NewPadded(makeSectionTitle("Notes")),
+		container.NewPadded(notesEntry),
 	))
 
 	form := container.NewVBox(
 		container.NewPadded(formCard),
 		container.NewPadded(container.NewVBox(
 			errorLabel,
-			container.NewHBox(saveBtn, cancelBtn),
+			makeButtonBar(
+				makePrimaryBtn("Save", theme.DocumentSaveIcon(), doSave),
+				makeLowBtn("Cancel", theme.CancelIcon(), func() {
+					ui.formDirty = false
+					ui.showSecretsList()
+				}),
+			),
 		)),
 	)
 
 	ui.content.Objects = []fyne.CanvasObject{container.NewScroll(form)}
 	ui.content.Refresh()
+	ui.window.Canvas().Focus(nameEntry)
 }
 
-// showEditSecret shows the edit secret form
+// showEditSecret shows the edit secret form.
 func (ui *LocalVaultUI) showEditSecret(secret *vault.SecretData) {
 	// Ensure we have the full decrypted secret (list items may be scrubbed)
 	full, err := ui.vault.GetSecretAudited(secret.ID)
@@ -1500,6 +1959,7 @@ func (ui *LocalVaultUI) showEditSecret(secret *vault.SecretData) {
 		return
 	}
 	secret = full
+
 	nameEntry := widget.NewEntry()
 	nameEntry.SetText(secret.Name)
 
@@ -1508,6 +1968,15 @@ func (ui *LocalVaultUI) showEditSecret(secret *vault.SecretData) {
 
 	passwordEntry := widget.NewPasswordEntry()
 	passwordEntry.SetText(secret.Password)
+
+
+	generateBtn := makeLowBtn("Generate", theme.ViewRefreshIcon(), func() {
+		if !ui.vault.HasPermission(auth.CanRotateSecret) {
+			ui.showError("Permission denied", fmt.Errorf("missing %s", auth.CanRotateSecret))
+			return
+		}
+		passwordEntry.SetText(generateSecurePassword(20))
+	})
 
 	urlEntry := widget.NewEntry()
 	urlEntry.SetText(secret.URL)
@@ -1525,40 +1994,35 @@ func (ui *LocalVaultUI) showEditSecret(secret *vault.SecretData) {
 	tagsEntry := widget.NewEntry()
 	tagsEntry.SetText(strings.Join(secret.Tags, ", "))
 
-	errorLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{})
-	errorLabel.Importance = widget.DangerImportance
+	errorLabel := makeErrorLabel()
 
-	generateBtn := widget.NewButtonWithIcon("Generate", theme.ViewRefreshIcon(), func() {
-		password := generateSecurePassword(20)
-		passwordEntry.SetText(password)
-	})
+	// Mark dirty on any change so nav guard can warn before discarding.
+	markDirty := func(_ string) { ui.formDirty = true }
+	nameEntry.OnChanged = markDirty
+	usernameEntry.OnChanged = markDirty
+	passwordEntry.OnChanged = markDirty
+	urlEntry.OnChanged = markDirty
+	tagsEntry.OnChanged = markDirty
+	notesEntry.OnChanged = markDirty
 
-	saveBtn := widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), func() {
+	doSave := func() {
 		errorLabel.SetText("")
-
 		name := strings.TrimSpace(nameEntry.Text)
 		if name == "" {
 			errorLabel.SetText("Name is required")
 			return
 		}
-
 		password := passwordEntry.Text
 		if password == "" {
 			errorLabel.SetText("Password is required")
 			return
 		}
-
-		// Parse tags
 		var tags []string
-		if tagsEntry.Text != "" {
-			for _, t := range strings.Split(tagsEntry.Text, ",") {
-				t = strings.TrimSpace(t)
-				if t != "" {
-					tags = append(tags, t)
-				}
+		for _, t := range strings.Split(tagsEntry.Text, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				tags = append(tags, t)
 			}
 		}
-
 		updated := &vault.SecretData{
 			ID:       secret.ID,
 			Name:     name,
@@ -1569,73 +2033,53 @@ func (ui *LocalVaultUI) showEditSecret(secret *vault.SecretData) {
 			Category: categorySelect.Selected,
 			Tags:     tags,
 		}
-
 		if err := ui.vault.UpdateSecretAudited(updated); err != nil {
 			errorLabel.SetText(err.Error())
 			return
 		}
-
+		ui.formDirty = false
 		ui.showNotification("Secret updated successfully")
 		ui.showSecretsList()
-	})
-	saveBtn.Importance = widget.HighImportance
-
-	cancelBtn := widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() {
-		ui.showSecretDetails(secret)
-	})
-
-	var historyBtn fyne.CanvasObject
-	if ui.vault.HasPermission(auth.CanManagePolicy) {
-		historyBtn = widget.NewButtonWithIcon("Password History", theme.HistoryIcon(), func() {
-			ui.showPasswordHistory(secret)
-		})
 	}
 
-	strengthLabel := widget.NewLabelWithStyle("Strength: —", fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
-	strengthLabel.Importance = widget.LowImportance
-	// Initialise with current password strength
-	{
-		label, imp := passwordStrength(secret.Password)
-		strengthLabel.SetText("Strength: " + label)
-		strengthLabel.Importance = imp
-	}
-	passwordEntry.OnChanged = func(pw string) {
-		label, imp := passwordStrength(pw)
-		strengthLabel.SetText("Strength: " + label)
-		strengthLabel.Importance = imp
-		strengthLabel.Refresh()
-	}
+	editPwRow := container.NewBorder(nil, nil, nil, generateBtn, makeFullWidthEntry(passwordEntry))
 
 	editCard := widget.NewCard("Edit Secret", secret.Name, container.NewVBox(
-		container.New(layout.NewFormLayout(),
-			widget.NewLabel("Name *"), nameEntry,
-			widget.NewLabel("Username"), usernameEntry,
-			widget.NewLabel("Password *"), container.NewBorder(nil, nil, nil, generateBtn, passwordEntry),
-			widget.NewLabel("URL"), urlEntry,
-			widget.NewLabel("Category"), categorySelect,
-			widget.NewLabel("Tags"), tagsEntry,
-		),
-		strengthLabel,
-		widget.NewSeparator(),
-		widget.NewLabel("Notes"),
-		notesEntry,
+		container.NewPadded(makeFormRow("Name *", makeFullWidthEntry(nameEntry))),
+		container.NewPadded(makeFormRow("Username", makeFullWidthEntry(usernameEntry))),
+		container.NewPadded(makeFormRow("Password *", editPwRow)),
+		container.NewPadded(makeFormRow("URL", makeFullWidthEntry(urlEntry))),
+		container.NewPadded(makeFormRow("Category", categorySelect)),
+		container.NewPadded(makeFormRow("Tags", makeFullWidthEntry(tagsEntry))),
+		makeDivider(),
+		container.NewPadded(makeSectionTitle("Notes")),
+		container.NewPadded(notesEntry),
 	))
 
-	actionItems := []fyne.CanvasObject{saveBtn, cancelBtn}
-	if historyBtn != nil {
-		actionItems = append(actionItems, historyBtn)
+	actionBtns := []fyne.CanvasObject{
+		makePrimaryBtn("Save", theme.DocumentSaveIcon(), doSave),
+		makeLowBtn("Cancel", theme.CancelIcon(), func() {
+			ui.formDirty = false
+			ui.showSecretDetails(secret)
+		}),
+	}
+	if ui.vault.HasPermission(auth.CanManagePolicy) {
+		actionBtns = append(actionBtns,
+			makeSecondaryBtn("History", theme.HistoryIcon(), func() { ui.showPasswordHistory(secret) }),
+		)
 	}
 
 	form := container.NewVBox(
 		container.NewPadded(editCard),
 		container.NewPadded(container.NewVBox(
 			errorLabel,
-			container.NewHBox(actionItems...),
+			makeButtonBar(actionBtns...),
 		)),
 	)
 
 	ui.content.Objects = []fyne.CanvasObject{container.NewScroll(form)}
 	ui.content.Refresh()
+	ui.window.Canvas().Focus(nameEntry)
 }
 
 // showShareSecretDialog opens a dialog to share or view sharing for a secret.
@@ -1656,10 +2100,9 @@ func (ui *LocalVaultUI) showShareSecretDialog(secret *vault.SecretData) {
 		userSelect.PlaceHolder = "Select user..."
 		canUpdateChk := widget.NewCheck("Can edit", nil)
 		canDeleteChk := widget.NewCheck("Can delete", nil)
-		errLbl := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{})
-		errLbl.Importance = widget.DangerImportance
+		errLbl := makeErrorLabel()
 
-		grantBtn := widget.NewButtonWithIcon("Grant Access", theme.ConfirmIcon(), func() {
+		grantBtn := makePrimaryBtn("Grant Access", theme.ConfirmIcon(), func() {
 			if userSelect.Selected == "" {
 				errLbl.SetText("Please select a user")
 				return
@@ -1675,10 +2118,9 @@ func (ui *LocalVaultUI) showShareSecretDialog(secret *vault.SecretData) {
 				fmt.Sprintf("Access granted to %s", userSelect.Selected), ui.window)
 			ui.showShareSecretDialog(secret)
 		})
-		grantBtn.Importance = widget.HighImportance
 
 		shareSection = container.NewVBox(
-			widget.NewLabelWithStyle("Grant access to:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			makeHeading("Grant access to:"),
 			userSelect,
 			container.NewHBox(canUpdateChk, canDeleteChk),
 			grantBtn,
@@ -1692,7 +2134,7 @@ func (ui *LocalVaultUI) showShareSecretDialog(secret *vault.SecretData) {
 		sharesSection = widget.NewLabel("Not currently shared with anyone.")
 	} else {
 		headerRow := container.NewGridWithColumns(4,
-			boldLabel("User"), boldLabel("Edit"), boldLabel("Delete"), boldLabel("Actions"),
+			makeHeading("User"), makeHeading("Edit"), makeHeading("Delete"), makeHeading("Actions"),
 		)
 		rows := []fyne.CanvasObject{headerRow}
 		for _, a := range shares {
@@ -1705,7 +2147,7 @@ func (ui *LocalVaultUI) showShareSecretDialog(secret *vault.SecretData) {
 			if a.CanDelete {
 				deleteTxt = "Yes"
 			}
-			revokeBtn := widget.NewButtonWithIcon("Revoke", theme.CancelIcon(), func() {
+			revokeBtn := makeDangerBtn("Revoke", theme.CancelIcon(), func() {
 				dialog.ShowConfirm("Revoke Access",
 					fmt.Sprintf("Revoke %s's access?", a.Username),
 					func(ok bool) {
@@ -1719,7 +2161,6 @@ func (ui *LocalVaultUI) showShareSecretDialog(secret *vault.SecretData) {
 						ui.showShareSecretDialog(secret)
 					}, ui.window)
 			})
-			revokeBtn.Importance = widget.DangerImportance
 			rows = append(rows, container.NewGridWithColumns(4,
 				widget.NewLabel(a.Username),
 				widget.NewLabel(editTxt),
@@ -1731,11 +2172,11 @@ func (ui *LocalVaultUI) showShareSecretDialog(secret *vault.SecretData) {
 	}
 
 	content := container.NewVBox(
-		widget.NewLabelWithStyle(fmt.Sprintf("Sharing: %s", secret.Name), fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Current access", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		makeHeading(fmt.Sprintf("Sharing: %s", secret.Name)),
+		makeDivider(),
+		makeHeading("Current access"),
 		sharesSection,
-		widget.NewSeparator(),
+		makeDivider(),
 		shareSection,
 	)
 
@@ -1746,11 +2187,6 @@ func (ui *LocalVaultUI) showShareSecretDialog(secret *vault.SecretData) {
 	d.Show()
 }
 
-// boldLabel is a helper used inside sharing dialog.
-func boldLabel(text string) *widget.Label {
-	return widget.NewLabelWithStyle(text, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-}
-
 // showPasswordHistory shows password history for a secret
 func (ui *LocalVaultUI) showPasswordHistory(secret *vault.SecretData) {
 	// Only administrators may view password history
@@ -1758,8 +2194,6 @@ func (ui *LocalVaultUI) showPasswordHistory(secret *vault.SecretData) {
 		ui.showError("Permission denied", fmt.Errorf("only administrators may view password history"))
 		return
 	}
-	title := widget.NewLabelWithStyle(fmt.Sprintf("Password History: %s", secret.Name), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-
 	history, err := ui.vault.GetPasswordHistory(secret.ID)
 	if err != nil {
 		ui.showError("Failed to load history", err)
@@ -1767,7 +2201,7 @@ func (ui *LocalVaultUI) showPasswordHistory(secret *vault.SecretData) {
 	}
 
 	var items []fyne.CanvasObject
-	items = append(items, title, widget.NewSeparator())
+	items = append(items, makeHeading(fmt.Sprintf("Password History: %s", secret.Name)), makeDivider())
 
 	if len(history) == 0 {
 		items = append(items, widget.NewLabel("No password history available"))
@@ -1781,14 +2215,13 @@ func (ui *LocalVaultUI) showPasswordHistory(secret *vault.SecretData) {
 				widget.NewLabel("Password: [redacted]"),
 			)
 			items = append(items, container.NewHBox(entry))
-			items = append(items, widget.NewSeparator())
+			items = append(items, makeDivider())
 		}
 	}
 
-	backBtn := widget.NewButtonWithIcon("Back", theme.NavigateBackIcon(), func() {
+	items = append(items, makeLowBtn("Back", theme.NavigateBackIcon(), func() {
 		ui.showSecretDetails(secret)
-	})
-	items = append(items, backBtn)
+	}))
 
 	ui.content.Objects = []fyne.CanvasObject{container.NewScroll(container.NewVBox(items...))}
 	ui.content.Refresh()
@@ -1802,14 +2235,28 @@ func (ui *LocalVaultUI) showSearch() {
 		return
 	}
 
-	searchEntry := widget.NewEntry()
-	searchEntry.SetPlaceHolder("Type a name to search...")
+	// Load all secrets once to derive the real category list.
+	allSecrets, _ := ui.vault.ListSecrets()
+	catSet := map[string]struct{}{}
+	for _, s := range allSecrets {
+		if s.Category != "__SYSTEM__" {
+			cat := s.Category
+			if cat == "" {
+				cat = "uncategorised"
+			}
+			catSet[cat] = struct{}{}
+		}
+	}
+	var categories []string
+	for c := range catSet {
+		categories = append(categories, c)
+	}
+	sort.Strings(categories)
 
-	categorySelect := widget.NewSelect(
-		[]string{"", "login", "api", "wifi", "server", "database", "other"},
-		nil,
-	)
-	categorySelect.PlaceHolder = "All categories"
+	searchEntry := widget.NewEntry()
+	searchEntry.SetPlaceHolder("Type a name to search…")
+
+	var activeCategory string
 
 	resultsContainer := container.NewVBox()
 	resultsLabel := widget.NewLabelWithStyle("Results", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
@@ -1817,9 +2264,8 @@ func (ui *LocalVaultUI) showSearch() {
 
 	doSearch := func() {
 		query := strings.TrimSpace(searchEntry.Text)
-		category := categorySelect.Selected
 
-		results, err := ui.vault.SearchSecrets(query, category, nil)
+		results, err := ui.vault.SearchSecrets(query, activeCategory, nil)
 		if err != nil {
 			ui.showError("Search failed", err)
 			return
@@ -1845,13 +2291,18 @@ func (ui *LocalVaultUI) showSearch() {
 					cat = "uncategorised"
 				}
 				nameLabel := widget.NewLabelWithStyle(s.Name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+				sep := widget.NewLabel("·")
+				sep.Importance = widget.LowImportance
 				catLabel := widget.NewLabel(cat)
 				catLabel.Importance = widget.LowImportance
 				row := container.NewHBox(
-					widget.NewIcon(theme.DocumentIcon()),
-					container.NewVBox(nameLabel, catLabel),
+					widget.NewIcon(categoryIcon(cat)),
+					nameLabel,
+					sep,
+					catLabel,
 					layout.NewSpacer(),
-					widget.NewButtonWithIcon("Open", theme.NavigateNextIcon(), func() {
+					makeLowBtn("Open", nil, func() {
+						ui.detailBack = ui.showSearch
 						ui.showSecretDetails(s)
 					}),
 				)
@@ -1863,25 +2314,31 @@ func (ui *LocalVaultUI) showSearch() {
 		resultsContainer.Refresh()
 	}
 
-	searchBtn := widget.NewButtonWithIcon("Search", theme.SearchIcon(), doSearch)
-	searchBtn.Importance = widget.HighImportance
+	// Category chip filter — same pattern as secrets list.
+	categoryRow := makeCategoryFilterRow(categories, func(cat string) {
+		activeCategory = cat
+		doSearch()
+	})
+
 	searchEntry.OnSubmitted = func(_ string) { doSearch() }
 
-	searchCard := widget.NewCard("Search Secrets", "Find secrets by name or category", container.NewVBox(
-		container.New(layout.NewFormLayout(),
-			widget.NewLabel("Name"), searchEntry,
-			widget.NewLabel("Category"), categorySelect,
-		),
-		searchBtn,
-	))
+	searchBar := makeSearchBar("Type a name to search…", func(q string) {
+		searchEntry.SetText(q)
+		doSearch()
+	})
 
 	page := container.NewVBox(
-		container.NewPadded(searchCard),
+		makePageHeader("Search", "Find secrets by name or category", nil),
+		container.NewPadded(widget.NewCard("", "", container.NewVBox(
+			container.NewPadded(searchBar),
+			container.NewPadded(categoryRow),
+		))),
 		container.NewPadded(container.NewVBox(resultsLabel, resultsContainer)),
 	)
 
 	ui.content.Objects = []fyne.CanvasObject{container.NewScroll(page)}
 	ui.content.Refresh()
+	ui.window.Canvas().Focus(searchEntry)
 }
 
 // showSettings shows the settings screen
@@ -1979,169 +2436,170 @@ func (ui *LocalVaultUI) showSettings() {
 		return
 	}
 
-	// ── Profile card ──────────────────────────────────────────────────────────
+	// ── Profile tab ───────────────────────────────────────────────────────────
 	emailDisplay := profile.Email
 	if emailDisplay == "" {
 		emailDisplay = "(not set)"
 	}
-	profileForm := container.New(layout.NewFormLayout(),
-		widget.NewLabel("Username"), widget.NewLabel(profile.Username),
-		widget.NewLabel("Email"), widget.NewLabel(emailDisplay),
-		widget.NewLabel("Role"), widget.NewLabel(profile.Role),
-		widget.NewLabel("Created"), widget.NewLabel(profile.CreatedAt.Format("2006-01-02")),
-		widget.NewLabel("Last Login"), widget.NewLabel(profile.LastLogin.Format("2006-01-02 15:04")),
+	profileInfoRows := container.NewVBox(
+		makeInfoRow(theme.AccountIcon(), "Username", profile.Username),
+		makeDivider(),
+		makeInfoRow(theme.MailComposeIcon(), "Email", emailDisplay),
+		makeDivider(),
+		makeInfoRow(theme.ListIcon(), "Role", profile.Role),
+		makeDivider(),
+		makeInfoRow(theme.HistoryIcon(), "Created", profile.CreatedAt.Format("2006-01-02")),
+		makeDivider(),
+		makeInfoRow(theme.LoginIcon(), "Last Login", profile.LastLogin.Format("2006-01-02 15:04")),
 	)
-	editProfileBtn := widget.NewButtonWithIcon("Edit Profile", theme.DocumentCreateIcon(), func() {
-		ui.showEditProfileDialog()
-	})
-	profileCard := widget.NewCard("User Profile", "", container.NewVBox(profileForm, editProfileBtn))
+	profileContent := container.NewVBox(
+		makeSectionCard("Account Details", "Your account information", profileInfoRows),
+		container.NewPadded(makeButtonBar(
+			makePrimaryBtn("Edit Profile", theme.DocumentCreateIcon(), func() {
+				ui.showEditProfileDialog()
+			}),
+		)),
+	)
+	profileTab := container.NewTabItem("Profile", boundedScroll(container.NewPadded(profileContent)))
 
-	// ── Security card ─────────────────────────────────────────────────────────
+	// ── Security tab ──────────────────────────────────────────────────────────
 	mfaStatus := "Disabled"
+	mfaImp := widget.WarningImportance
 	if profile.MFAEnabled {
 		mfaStatus = "Enabled"
+		mfaImp = widget.SuccessImportance
 	}
 	mfaStatusLabel := widget.NewLabel(mfaStatus)
-	if profile.MFAEnabled {
-		mfaStatusLabel.Importance = widget.SuccessImportance
-	} else {
-		mfaStatusLabel.Importance = widget.WarningImportance
-	}
-	changePassBtn := widget.NewButtonWithIcon("Change Password", theme.AccountIcon(), func() {
-		ui.showChangePassword()
-	})
-	mfaBtn := widget.NewButtonWithIcon("Configure MFA", theme.SettingsIcon(), func() {
-		ui.showMFASettings()
-	})
-	securityCard := widget.NewCard("Security", "", container.NewVBox(
-		container.New(layout.NewFormLayout(),
-			widget.NewLabel("MFA Status"), mfaStatusLabel,
-		),
-		container.NewHBox(changePassBtn, mfaBtn),
-	))
+	mfaStatusLabel.Importance = mfaImp
 
-	// ── Backup card ───────────────────────────────────────────────────────────
-	exportBtn := widget.NewButtonWithIcon("Export Vault Backup", theme.DownloadIcon(), func() {
-		dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
-			if err != nil {
-				ui.showError("Export failed", err)
-				return
-			}
-			if writer == nil {
-				return
-			}
-			writer.Close()
-			exportPath := ensureExt(writer.URI().Path(), ".pwm")
-			if err := ui.vault.ExportVault(exportPath); err != nil {
-				ui.showError("Export failed", err)
-			} else {
-				ui.showNotification("Vault exported successfully")
-			}
-		}, ui.window)
-	})
-
-	stats, _ := ui.vault.GetStatsByUser()
-	statsForm := container.New(layout.NewFormLayout(),
-		widget.NewLabel("Your secrets"), widget.NewLabel(fmt.Sprintf("%v", stats["my_entries"])),
-		widget.NewLabel("Total in vault"), widget.NewLabel(fmt.Sprintf("%v", stats["total_entries"])),
-		widget.NewLabel("Vault file"), widget.NewLabel(fmt.Sprintf("%v", stats["file_path"])),
+	securityInfoRows := container.NewVBox(
+		makeInfoRow(theme.ConfirmIcon(), "MFA Status", mfaStatus),
 	)
-	backupCard := widget.NewCard("Backup & Statistics", "", container.NewVBox(statsForm, exportBtn))
+	securityContent := container.NewVBox(
+		makeSectionCard("Security Status", "Configure your account security settings", securityInfoRows),
+		container.NewPadded(makeButtonBar(
+			makePrimaryBtn("Change Password", theme.AccountIcon(), func() { ui.showChangePassword() }),
+			makeSecondaryBtn("Configure MFA", theme.SettingsIcon(), func() { ui.showMFASettings() }),
+		)),
+	)
+	_ = mfaStatusLabel // consumed inline above
+	securityTab := container.NewTabItem("Security", boundedScroll(container.NewPadded(securityContent)))
 
-	sections := []fyne.CanvasObject{
-		container.NewPadded(widget.NewLabelWithStyle("Settings", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})),
-		widget.NewSeparator(),
-		container.NewPadded(profileCard),
-		container.NewPadded(securityCard),
-		container.NewPadded(backupCard),
+	// ── Backup tab ────────────────────────────────────────────────────────────
+	stats, _ := ui.vault.GetStatsByUser()
+	backupInfoRows := container.NewVBox(
+		makeInfoRow(theme.StorageIcon(), "Your secrets", fmt.Sprintf("%v", stats["my_entries"])),
+		makeDivider(),
+		makeInfoRow(theme.FileIcon(), "Vault file", fmt.Sprintf("%v", stats["file_path"])),
+	)
+	// "Total in vault" reveals how many secrets other users own — restrict to
+	// roles that already have full vault visibility (SecurityOfficer, Administrator).
+	if ui.vault.HasPermission(auth.CanViewAuditLogs) {
+		backupInfoRows.Add(makeDivider())
+		backupInfoRows.Add(makeInfoRow(theme.FolderIcon(), "Total in vault", fmt.Sprintf("%v", stats["total_entries"])))
+	}
+	backupContent := container.NewVBox(
+		makeSectionCard("Vault Statistics", "Storage information and backup options", backupInfoRows),
+		container.NewPadded(makeButtonBar(
+			makePrimaryBtn("Export Vault Backup", theme.DownloadIcon(), func() {
+				dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
+					if err != nil {
+						ui.showError("Export failed", err)
+						return
+					}
+					if writer == nil {
+						return
+					}
+					writer.Close()
+					exportPath := ensureExt(writer.URI().Path(), ".pwm")
+					if err := ui.vault.ExportVault(exportPath); err != nil {
+						ui.showError("Export failed", err)
+					} else {
+						ui.showNotification("Vault exported successfully")
+					}
+				}, ui.window)
+			}),
+		)),
+	)
+	backupTab := container.NewTabItem("Backup", boundedScroll(container.NewPadded(backupContent)))
+
+	tabs := []*container.TabItem{profileTab, securityTab, backupTab}
+
+	// ── Admin tab (role-gated) ────────────────────────────────────────────────
+	if ui.vault.HasPermission(auth.CanManagePolicy) || ui.vault.HasPermission(auth.CanViewUsers) ||
+		ui.vault.HasPermission(auth.CanViewAuditLogs) {
+
+		adminItems := []fyne.CanvasObject{
+			container.NewPadded(makePrimaryBtn("Open Admin Dashboard", theme.GridIcon(), func() {
+				ui.showAdminDashboard()
+			})),
+		}
+		if ui.vault.HasPermission(auth.CanManagePolicy) {
+			vaultKeyCard := widget.NewCard("Vault Access Key",
+				"Require all users to enter a shared key after login.",
+				ui.buildVaultKeySettings(),
+			)
+			adminItems = append(adminItems, container.NewPadded(vaultKeyCard))
+		}
+		adminTab := container.NewTabItem("Admin",
+			boundedScroll(container.NewPadded(container.NewVBox(adminItems...))))
+		tabs = append(tabs, adminTab)
 	}
 
-	// ── Vault Access Key card (admin only) ────────────────────────────────────
-	if ui.vault.HasPermission(auth.CanManagePolicy) {
-		vaultKeyCard := widget.NewCard("Vault Access Key", "Require all users to enter a shared key after login.", ui.buildVaultKeySettings())
-		sections = append(sections, container.NewPadded(vaultKeyCard))
-	}
+	appTabs := container.NewAppTabs(tabs...)
+	appTabs.SetTabLocation(container.TabLocationTop)
 
-	// ── Admin shortcut card ───────────────────────────────────────────────────
-	if ui.vault.HasPermission(auth.CanManagePolicy) || ui.vault.HasPermission(auth.CanViewUsers) {
-		adminBtn := widget.NewButtonWithIcon("Open Admin Dashboard", theme.GridIcon(), func() {
-			ui.showAdminDashboard()
-		})
-		adminBtn.Importance = widget.HighImportance
-		adminCard := widget.NewCard("Administration", "Manage users, audit logs, exports, and security policy.", adminBtn)
-		sections = append(sections, container.NewPadded(adminCard))
-	} else if ui.vault.HasPermission(auth.CanViewAuditLogs) {
-		adminBtn := widget.NewButtonWithIcon("Open Audit & Policy Panel", theme.GridIcon(), func() {
-			ui.showAdminDashboard()
-		})
-		adminBtn.Importance = widget.HighImportance
-		adminCard := widget.NewCard("Administration", "View audit logs and security policy.", adminBtn)
-		sections = append(sections, container.NewPadded(adminCard))
-	}
+	pageHeader := makePageHeader("Settings", "Manage your account and vault configuration", nil)
 
-	ui.content.Objects = []fyne.CanvasObject{container.NewScroll(container.NewVBox(sections...))}
+	ui.content.Objects = []fyne.CanvasObject{
+		container.NewBorder(pageHeader, nil, nil, nil, appTabs),
+	}
 	ui.content.Refresh()
 }
 
-// showChangePassword shows password change form
+// showChangePassword shows password change form.
 func (ui *LocalVaultUI) showChangePassword() {
-	title := widget.NewLabelWithStyle("Change Password", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-
 	currentEntry := widget.NewPasswordEntry()
-	currentEntry.SetPlaceHolder("Current Password")
+	currentEntry.SetPlaceHolder("Current password")
 
 	newEntry := widget.NewPasswordEntry()
-	newEntry.SetPlaceHolder("New Password (must meet security policy)")
+	newEntry.SetPlaceHolder("Must meet security policy")
 
 	confirmEntry := widget.NewPasswordEntry()
-	confirmEntry.SetPlaceHolder("Confirm New Password")
+	confirmEntry.SetPlaceHolder("Re-enter new password")
 
-	errorLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{})
-	errorLabel.Importance = widget.DangerImportance
+	errorLabel := makeErrorLabel()
 
-	changeBtn := widget.NewButtonWithIcon("Change Password", theme.ConfirmIcon(), func() {
+	doChange := func() {
 		errorLabel.SetText("")
-
-		current := currentEntry.Text
-		newPass := newEntry.Text
-		confirm := confirmEntry.Text
-
-		if newPass != confirm {
+		if newEntry.Text != confirmEntry.Text {
 			errorLabel.SetText("New passwords do not match")
 			return
 		}
-
-		if err := ui.vault.ChangePassword(current, newPass); err != nil {
+		if err := ui.vault.ChangePassword(currentEntry.Text, newEntry.Text); err != nil {
 			errorLabel.SetText(err.Error())
 			return
 		}
-
-		// Vault is now locked – require re-authentication after password change (Req 3.6)
 		dialog.ShowInformation("Password Changed",
 			"Password changed successfully. Please log in again with your new password.",
 			ui.window)
 		ui.showLandingScreen()
-	})
-	changeBtn.Importance = widget.HighImportance
+	}
+	confirmEntry.OnSubmitted = func(_ string) { doChange() }
 
-	cancelBtn := widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() {
-		ui.showSettings()
-	})
+	card := widget.NewCard("Change Password", "", container.NewVBox(
+		container.NewPadded(makeFormRow("Current", currentEntry)),
+		container.NewPadded(makeFormRow("New", newEntry)),
+		container.NewPadded(makeFormRow("Confirm", confirmEntry)),
+		makeDivider(),
+		container.NewPadded(errorLabel),
+		container.NewPadded(makeButtonBar(
+			makePrimaryBtn("Change Password", theme.ConfirmIcon(), doChange),
+			makeLowBtn("Cancel", theme.CancelIcon(), func() { ui.showSettings() }),
+		)),
+	))
 
-	form := container.NewVBox(
-		title,
-		widget.NewSeparator(),
-		widget.NewLabel("Current Password"),
-		currentEntry,
-		widget.NewLabel("New Password"),
-		newEntry,
-		widget.NewLabel("Confirm New Password"),
-		confirmEntry,
-		errorLabel,
-		container.NewHBox(changeBtn, cancelBtn),
-	)
-
-	ui.content.Objects = []fyne.CanvasObject{container.NewPadded(form)}
+	ui.content.Objects = []fyne.CanvasObject{container.NewPadded(card)}
 	ui.content.Refresh()
 }
 
@@ -2194,10 +2652,9 @@ func (ui *LocalVaultUI) showForcedPasswordChange(reason string) {
 	confirmEntry := widget.NewPasswordEntry()
 	confirmEntry.SetPlaceHolder("Confirm New Password")
 
-	errorLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{})
-	errorLabel.Importance = widget.DangerImportance
+	errorLabel := makeErrorLabel()
 
-	changeBtn := widget.NewButtonWithIcon("Set New Password", theme.ConfirmIcon(), func() {
+	changeBtn := makePrimaryBtn("Set New Password", theme.ConfirmIcon(), func() {
 		errorLabel.SetText("")
 		current := currentEntry.Text
 		newPass := newEntry.Text
@@ -2218,34 +2675,44 @@ func (ui *LocalVaultUI) showForcedPasswordChange(reason string) {
 			ui.window)
 		ui.showLandingScreen()
 	})
-	changeBtn.Importance = widget.HighImportance
 
-	logoutBtn := widget.NewButtonWithIcon("Logout Instead", theme.CancelIcon(), func() {
-		_ = ui.vault.Logout()
-		ui.currentUser = ""
-		ui.showLandingScreen()
+	logoutBtn := makeLowBtn("Logout Instead", theme.CancelIcon(), func() {
+		dialog.ShowConfirm(
+			"Log Out",
+			"Are you sure you want to log out?",
+			func(confirmed bool) {
+				if !confirmed {
+					return
+				}
+				_ = ui.vault.Logout()
+				ui.currentUser = ""
+				ui.showLandingScreen()
+			},
+			ui.window,
+		)
 	})
-	logoutBtn.Importance = widget.LowImportance
 
-	form := container.NewVBox(
-		widget.NewLabelWithStyle("Password Change Required", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		widget.NewSeparator(),
-		reasonLbl,
-		widget.NewSeparator(),
-		widget.NewLabel("Current Password"), currentEntry,
-		widget.NewLabel("New Password"), newEntry,
-		widget.NewLabel("Confirm New Password"), confirmEntry,
-		errorLabel,
-		changeBtn,
-		widget.NewSeparator(),
-		container.NewCenter(logoutBtn),
+	fields := container.NewVBox(
+		container.NewPadded(reasonLbl),
+		makeDivider(),
+		container.NewPadded(makeFormRow("Current", makeRevealEntry(currentEntry))),
+		container.NewPadded(makeFormRow("New", makeRevealEntry(newEntry))),
+		container.NewPadded(makeFormRow("Confirm", makeRevealEntry(confirmEntry))),
+		container.NewPadded(errorLabel),
 	)
+
+	card := makeAuthCard("Password Change Required", "Set a new password to continue", container.NewVBox(
+		container.NewPadded(fields),
+		makeDivider(),
+		container.NewPadded(makeButtonBar(changeBtn)),
+		container.NewCenter(logoutBtn),
+	))
 
 	ui.window.SetContent(ui.withFooter(
 		container.NewCenter(
 			container.NewVBox(
 				widthEnforcer,
-				container.NewPadded(widget.NewCard("", "", container.NewPadded(form))),
+				container.NewPadded(card),
 			),
 		),
 	))
@@ -2253,15 +2720,13 @@ func (ui *LocalVaultUI) showForcedPasswordChange(reason string) {
 
 // showMFASettings shows MFA configuration
 func (ui *LocalVaultUI) showMFASettings() {
-	title := widget.NewLabelWithStyle("MFA Configuration", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-
 	profile, _ := ui.vault.GetUserProfile()
 
-	var content fyne.CanvasObject
+	var cardBody fyne.CanvasObject
+	var cardSubtitle string
 
 	if profile.MFAEnabled {
-		// Show disable option
-		disableBtn := widget.NewButtonWithIcon("Disable MFA", theme.DeleteIcon(), func() {
+		disableBtn := makeDangerBtn("Disable MFA", theme.DeleteIcon(), func() {
 			dialog.ShowEntryDialog("Confirm Password", "Enter your password to disable MFA", func(password string) {
 				if err := ui.vault.DisableMFA(password); err != nil {
 					ui.showError("Failed to disable MFA", err)
@@ -2271,18 +2736,15 @@ func (ui *LocalVaultUI) showMFASettings() {
 				}
 			}, ui.window)
 		})
-		disableBtn.Importance = widget.DangerImportance
-
-		content = container.NewVBox(
-			title,
-			widget.NewSeparator(),
-			widget.NewLabel("MFA is currently ENABLED"),
-			widget.NewLabel("Your vault is protected with two-factor authentication."),
-			disableBtn,
+		cardSubtitle = "Two-factor authentication is active on your account"
+		cardBody = container.NewVBox(
+			makeInfoRow(theme.ConfirmIcon(), "Status", "Enabled"),
+			makeDivider(),
+			container.NewPadded(widget.NewLabel("Your vault is protected with two-factor authentication.")),
+			container.NewPadded(makeButtonBar(disableBtn)),
 		)
 	} else {
-		// Show enable option
-		enableBtn := widget.NewButtonWithIcon("Set Up MFA Now", theme.ConfirmIcon(), func() {
+		enableBtn := makePrimaryBtn("Set Up MFA Now", theme.ConfirmIcon(), func() {
 			if !ui.vault.Vault.IsUnlocked() {
 				ui.showError("MFA Setup Failed", fmt.Errorf("vault is locked — please log in again"))
 				return
@@ -2296,29 +2758,30 @@ func (ui *LocalVaultUI) showMFASettings() {
 				ui.showError("Failed to start MFA setup", fmt.Errorf("generated secret is empty; please try again"))
 				return
 			}
-			// Non-mandatory path: cancel returns to settings
 			ui.showMFASetup(secret, false, ui.vault.VerifyAndActivateMFA, ui.showMFASettings)
 		})
-		enableBtn.Importance = widget.HighImportance
-
-		mfaNote := widget.NewLabel("MFA is required by policy.\nYou must scan the QR code with Microsoft Authenticator (or any TOTP app) to protect your account.")
+		mfaNote := widget.NewLabel("MFA is required by policy. Scan the QR code with Microsoft Authenticator (or any TOTP app) to protect your account.")
 		mfaNote.Wrapping = fyne.TextWrapWord
-
-		content = container.NewVBox(
-			title,
-			widget.NewSeparator(),
-			widget.NewLabel("⚠  MFA is currently DISABLED"),
-			mfaNote,
-			enableBtn,
+		cardSubtitle = "Protect your account with two-factor authentication"
+		cardBody = container.NewVBox(
+			makeInfoRow(nil, "Status", "Disabled"),
+			makeDivider(),
+			container.NewPadded(mfaNote),
+			container.NewPadded(makeButtonBar(enableBtn)),
 		)
 	}
 
-	backBtn := widget.NewButtonWithIcon("Back", theme.NavigateBackIcon(), func() {
-		ui.showSettings()
-	})
+	header := makePageHeader("MFA Configuration", "Manage two-factor authentication for your account", nil)
+	card := makeSectionCard("Authentication Status", cardSubtitle, cardBody)
+	backBtn := makeLowBtn("← Back to Settings", theme.NavigateBackIcon(), func() { ui.showSettings() })
 
 	ui.content.Objects = []fyne.CanvasObject{
-		container.NewVBox(content, widget.NewSeparator(), backBtn),
+		container.NewBorder(
+			header,
+			container.NewPadded(makeButtonBar(backBtn)),
+			nil, nil,
+			boundedScroll(container.NewPadded(card)),
+		),
 	}
 	ui.content.Refresh()
 }
@@ -2345,12 +2808,14 @@ func (ui *LocalVaultUI) startMandatoryMFAEnrollment() {
 	// but guard defensively in case this is called from an unexpected code path.
 	if !ui.vault.Vault.IsUnlocked() {
 		ui.showError("Failed to start MFA setup", fmt.Errorf("vault is locked — please log in again"))
-		ui.savedPassword = ""
+		zeroAndClearBytes(ui.savedPassword)
+		ui.savedPassword = nil
 		ui.showLandingScreen()
 		return
 	}
-	// Password no longer needed — clear it now.
-	ui.savedPassword = ""
+	// Password no longer needed — zero and clear it now.
+	zeroAndClearBytes(ui.savedPassword)
+	ui.savedPassword = nil
 
 	secret, err := ui.vault.EnableMFA()
 	if err != nil {
@@ -2418,9 +2883,9 @@ func (ui *LocalVaultUI) showMFASetup(secret string, mandatory bool, verifyFn fun
 
 	// ── Instructions (no Wrapping – fixed height) ─────────────────────────────
 	instructions := widget.NewLabelWithStyle(
-		"1.  Open Microsoft Authenticator → Add account → Other account\n"+
-			"2.  Scan the QR code above with your phone\n"+
-			"3.  Enter the 6-digit code from the app below",
+		"1.  Open your authenticator app (Microsoft Authenticator, Google Authenticator, Authy, etc.)\n"+
+			"2.  Add a new account and scan the QR code above\n"+
+			"3.  Enter the 6-digit code shown in the app below to verify",
 		fyne.TextAlignLeading, fyne.TextStyle{})
 
 	// Manual-entry fallback
@@ -2432,22 +2897,31 @@ func (ui *LocalVaultUI) showMFASetup(secret string, mandatory bool, verifyFn fun
 	secretDisplay.Disable()
 
 	copySecretBtn := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
-		if ui.clipboardManager != nil {
-			_ = ui.clipboardManager.CopyToClipboard(secret)
-		} else {
-			ui.window.Clipboard().SetContent(secret)
-		}
-		ui.showNotification("Secret copied to clipboard")
+		_ = ui.clipboardManager.CopyToClipboard(secret)
+		ui.showNotification("Secret copied (auto-clears in 30s)")
 	})
 
 	// ── Verification ─────────────────────────────────────────────────────────
 	codeEntry := widget.NewEntry()
 	codeEntry.SetPlaceHolder("6-digit code from your app")
+	codeEntry.OnChanged = func(s string) {
+		filtered := ""
+		for _, r := range s {
+			if r >= '0' && r <= '9' {
+				filtered += string(r)
+			}
+		}
+		if len(filtered) > 6 {
+			filtered = filtered[:6]
+		}
+		if filtered != s {
+			codeEntry.SetText(filtered)
+		}
+	}
 
-	errorLabel := widget.NewLabelWithStyle("", fyne.TextAlignCenter, fyne.TextStyle{})
-	errorLabel.Importance = widget.DangerImportance
+	errorLabel := makeErrorLabel()
 
-	verifyBtn := widget.NewButtonWithIcon("Verify & Enable MFA", theme.ConfirmIcon(), func() {
+	verifyBtn := makePrimaryBtn("Verify & Enable MFA", theme.ConfirmIcon(), func() {
 		clean := strings.ReplaceAll(strings.TrimSpace(codeEntry.Text), " ", "")
 		if len(clean) != 6 {
 			errorLabel.SetText("Code must be exactly 6 digits")
@@ -2462,70 +2936,75 @@ func (ui *LocalVaultUI) showMFASetup(secret string, mandatory bool, verifyFn fun
 			ui.window)
 		onSuccess()
 	})
-	verifyBtn.Importance = widget.HighImportance
 	codeEntry.OnSubmitted = func(_ string) { verifyBtn.OnTapped() }
 
-	formFields := container.New(layout.NewFormLayout(),
-		widget.NewLabel("Secret key"), container.NewBorder(nil, nil, nil, copySecretBtn, secretDisplay),
-		widget.NewLabel("Verify code"), codeEntry,
+	copyURIBtn := makeLowBtn("Copy URI", theme.ContentCopyIcon(), func() {
+		_ = ui.clipboardManager.CopyToClipboard(provisioningURI)
+		ui.showNotification("Provisioning URI copied (auto-clears in 30s)")
+	})
+
+	formFields := container.NewVBox(
+		makeFormRow("Secret key", container.NewBorder(nil, nil, nil, copySecretBtn, secretDisplay)),
+		makeFormRow("Verify code", codeEntry),
+	)
+
+	// Shared body — used in both mandatory (full-window) and optional (content pane) layouts.
+	sharedBody := container.NewVBox(
+		container.NewCenter(qrWidget),
+		container.NewCenter(copyURIBtn),
+		makeDivider(),
+		container.NewPadded(instructions),
+		makeDivider(),
+		container.NewPadded(manualNote),
+		container.NewPadded(formFields),
+		makeDivider(),
+		errorLabel,
 	)
 
 	if mandatory {
 		// ── Mandatory full-window layout ──────────────────────────────────────
-		// Match exactly the login/register card pattern: no TextWrapWord, no
-		// NewScroll, branding inside the card content.
-		widthEnforcer := canvas.NewRectangle(color.Transparent)
-		widthEnforcer.SetMinSize(fyne.NewSize(560, 1))
-
-		appName := widget.NewLabelWithStyle("Password Manager", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		// No TextWrapWord — wrapped labels have zero min-height in Fyne cards.
+		appTitle := makeCenteredHeading("Password Manager")
 		appSub := widget.NewLabelWithStyle("Secure Enterprise Vault", fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
+		appSub.Importance = widget.LowImportance
 
 		warningLabel := widget.NewLabelWithStyle(
 			"⚠  MFA is mandatory – complete setup to access your vault",
 			fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 		warningLabel.Importance = widget.DangerImportance
 
-		mfaCard := widget.NewCard("Set Up Microsoft Authenticator", "",
+		logoutBtn := makeLowBtn("Back to Login", theme.NavigateBackIcon(), func() {
+			_ = ui.vault.Logout()
+			ui.currentUser = ""
+			ui.showLandingScreen()
+		})
+
+		mfaCard := widget.NewCard("Set Up Two-Factor Authentication", "",
 			container.NewVBox(
-				container.NewPadded(container.NewVBox(appName, appSub)),
-				widget.NewSeparator(),
+				container.NewPadded(container.NewVBox(appTitle, appSub)),
+				makeDivider(),
 				warningLabel,
-				widget.NewSeparator(),
-				container.NewCenter(qrWidget),
-				widget.NewSeparator(),
-				container.NewPadded(instructions),
-				widget.NewSeparator(),
-				container.NewPadded(container.NewVBox(manualNote)),
-				container.NewPadded(formFields),
-				widget.NewSeparator(),
-				errorLabel,
+				makeDivider(),
+				sharedBody,
 				verifyBtn,
 			),
 		)
 
-		ui.window.SetContent(ui.withFooter(container.NewCenter(
-			container.NewVBox(
-				widthEnforcer,
-				container.NewPadded(mfaCard),
-			),
-		)))
+		cardArea := container.NewVScroll(container.NewCenter(
+			container.NewVBox(minWidth(560), container.NewPadded(mfaCard)),
+		))
+
+		ui.window.SetContent(ui.withFooter(
+			container.NewBorder(nil, container.NewCenter(logoutBtn), nil, nil, cardArea),
+		))
 	} else {
 		// ── Non-mandatory: rendered inside the main content pane ──────────────
-		cancelBtn := widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() {
-			ui.showMFASettings()
-		})
+		cancelBtn := makeLowBtn("Cancel", theme.CancelIcon(), func() { ui.showMFASettings() })
 		form := container.NewVBox(
-			widget.NewLabelWithStyle("Set Up Two-Factor Authentication", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-			widget.NewSeparator(),
-			container.NewCenter(qrWidget),
-			widget.NewSeparator(),
-			container.NewPadded(instructions),
-			widget.NewSeparator(),
-			container.NewPadded(container.NewVBox(manualNote)),
-			container.NewPadded(formFields),
-			widget.NewSeparator(),
-			errorLabel,
-			container.NewHBox(verifyBtn, cancelBtn),
+			makeHeading("Set Up Two-Factor Authentication"),
+			makeDivider(),
+			sharedBody,
+			makeButtonBar(verifyBtn, cancelBtn),
 		)
 		ui.content.Objects = []fyne.CanvasObject{container.NewScroll(container.NewPadded(form))}
 		ui.content.Refresh()

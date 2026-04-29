@@ -31,7 +31,7 @@ type UserInfo struct {
 
 // GetUserManagementView creates the user management view
 func (aui *AdminUsersUI) GetUserManagementView(users []UserInfo, onRoleChange func(string, string), onLock func(string), onUnlock func(string), onDelete func(string)) *fyne.Container {
-	title := widget.NewLabelWithStyle("User Management", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	title := makeCenteredHeading("User Management")
 
 	if len(users) == 0 {
 		return container.NewVBox(title, widget.NewLabel("No users found"))
@@ -46,9 +46,9 @@ func (aui *AdminUsersUI) GetUserManagementView(users []UserInfo, onRoleChange fu
 				widget.NewLabel("Username"),
 				widget.NewLabel("Role"),
 				widget.NewLabel("Status"),
-				widget.NewToolbar(
-					widget.NewToolbarAction(theme.ContentUndoIcon(), func() {}),
-					widget.NewToolbarAction(theme.DeleteIcon(), func() {}),
+				container.NewHBox(
+					makeSecondaryBtn("", theme.ContentUndoIcon(), func() {}),
+					makeDangerBtn("", theme.DeleteIcon(), func() {}),
 				),
 			)
 		},
@@ -74,8 +74,8 @@ func (aui *AdminUsersUI) GetUserManagementView(users []UserInfo, onRoleChange fu
 
 	return container.NewVBox(
 		title,
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle(fmt.Sprintf("Total Users: %d", len(users)), fyne.TextAlignLeading, fyne.TextStyle{}),
+		makeDivider(),
+		widget.NewLabel(fmt.Sprintf("Total Users: %d", len(users))),
 		list,
 	)
 }

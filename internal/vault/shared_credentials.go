@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"password-manager/internal/auth"
 )
 
 // SharedAccess describes one named user's access rights on a shared secret.
@@ -56,7 +58,7 @@ func NewSharedCredentialManager(v *VaultWithUser) *SharedCredentialManager {
 }
 
 // ShareSecret grants a named user access to an existing secret.
-// The acting user must be the secret owner and have CanManagePolicy permission.
+// The acting user must be the secret owner and have CanShareSecret permission.
 func (m *SharedCredentialManager) ShareSecret(
 	actingUser, secretID, targetUser string,
 	canRead, canUpdate, canDelete bool,
@@ -72,8 +74,8 @@ func (m *SharedCredentialManager) ShareSecret(
 	if strings.TrimSpace(actingUser) != "" && !strings.EqualFold(strings.TrimSpace(actingUser), actor) {
 		return fmt.Errorf("permission denied: actor mismatch")
 	}
-	if err := m.vault.checkSecretPermission("manage_policy"); err != nil {
-		return fmt.Errorf("permission denied: sharing requires manage_policy permission")
+	if err := m.vault.checkSecretPermission(auth.CanShareSecret); err != nil {
+		return fmt.Errorf("permission denied: sharing requires share_secret permission")
 	}
 
 	secret, err := m.vault.Vault.getSecret(secretID)
@@ -352,7 +354,11 @@ func (m *SharedCredentialManager) loadMeta(secretID string) (*SharedSecretMeta, 
 }
 
 func (m *SharedCredentialManager) saveMeta(meta *SharedSecretMeta) error {
-	data := string(mustMarshalJSON(meta))
+	raw, err := marshalJSON(meta)
+	if err != nil {
+		return fmt.Errorf("failed to serialize share metadata: %w", err)
+	}
+	data := string(raw)
 	id := m.metaID(meta.SecretID)
 
 	// Check if entry already exists

@@ -11,11 +11,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// showLoginUI creates the login form components
-// Note: The primary login implementation is in local_vault_ui.go
-// This file provides reusable login form widgets
-
-// LoginForm represents a reusable login form
+// LoginForm represents a reusable login form widget.
 type LoginForm struct {
 	UsernameEntry *widget.Entry
 	PasswordEntry *widget.Entry
@@ -24,69 +20,58 @@ type LoginForm struct {
 	OnLogin       func(username, password, mfaCode string)
 }
 
-// NewLoginForm creates a new login form
+// NewLoginForm creates a new login form.
 func NewLoginForm(onLogin func(username, password, mfaCode string)) *LoginForm {
 	form := &LoginForm{
 		UsernameEntry: widget.NewEntry(),
 		PasswordEntry: widget.NewPasswordEntry(),
 		MFAEntry:      widget.NewEntry(),
-		ErrorLabel:    widget.NewLabelWithStyle("", fyne.TextAlignCenter, fyne.TextStyle{}),
+		ErrorLabel:    makeErrorLabel(),
 		OnLogin:       onLogin,
 	}
-
-	form.UsernameEntry.SetPlaceHolder("Username")
-	form.PasswordEntry.SetPlaceHolder("Password")
-	form.MFAEntry.SetPlaceHolder("MFA Code (if enabled)")
-	form.ErrorLabel.Importance = widget.DangerImportance
-
+	form.UsernameEntry.SetPlaceHolder("Enter your username")
+	form.PasswordEntry.SetPlaceHolder("Enter your password")
+	form.MFAEntry.SetPlaceHolder("6-digit code from your authenticator app")
 	return form
 }
 
-// GetContainer returns the login form as a container
+// GetContainer returns the login form as a modern card container.
 func (lf *LoginForm) GetContainer(showMFA bool) *fyne.Container {
-	items := []fyne.CanvasObject{
-		widget.NewLabelWithStyle("Login", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		widget.NewSeparator(),
-		widget.NewLabel("Username:"),
-		lf.UsernameEntry,
-		widget.NewLabel("Password:"),
-		lf.PasswordEntry,
-	}
+	loginBtn := makePrimaryBtn("Login", theme.LoginIcon(), func() {
+		username := strings.TrimSpace(lf.UsernameEntry.Text)
+		password := lf.PasswordEntry.Text
+		mfaCode := strings.TrimSpace(lf.MFAEntry.Text)
+		if username == "" || password == "" {
+			lf.ErrorLabel.SetText("Username and password are required")
+			return
+		}
+		if lf.OnLogin != nil {
+			lf.OnLogin(username, password, mfaCode)
+		}
+	})
+	lf.PasswordEntry.OnSubmitted = func(_ string) { loginBtn.OnTapped() }
 
-	if showMFA {
-		items = append(items,
-			widget.NewLabel("MFA Code:"),
-			lf.MFAEntry,
-		)
-	}
-
-	items = append(items,
-		lf.ErrorLabel,
-		widget.NewButtonWithIcon("Login", theme.LoginIcon(), func() {
-			username := strings.TrimSpace(lf.UsernameEntry.Text)
-			password := lf.PasswordEntry.Text
-			mfaCode := strings.TrimSpace(lf.MFAEntry.Text)
-
-			if username == "" || password == "" {
-				lf.ErrorLabel.SetText("Username and password are required")
-				return
-			}
-
-			if lf.OnLogin != nil {
-				lf.OnLogin(username, password, mfaCode)
-			}
-		}),
+	fields := container.NewVBox(
+		makeFormRow("Username", makeFullWidthEntry(lf.UsernameEntry)),
+		makeFormRow("Password", makeFullWidthEntry(lf.PasswordEntry)),
 	)
+	if showMFA {
+		fields.Add(makeFormRow("MFA Code", makeFullWidthEntry(lf.MFAEntry)))
+	}
 
-	return container.NewVBox(items...)
+	return container.NewVBox(
+		makeCenteredHeading("Sign In"),
+		makeDivider(),
+		container.NewPadded(fields),
+		lf.ErrorLabel,
+		loginBtn,
+	)
 }
 
-// SetError sets an error message on the login form
-func (lf *LoginForm) SetError(msg string) {
-	lf.ErrorLabel.SetText(msg)
-}
+// SetError sets an error message on the login form.
+func (lf *LoginForm) SetError(msg string) { lf.ErrorLabel.SetText(msg) }
 
-// Clear clears the login form fields
+// Clear resets all form fields.
 func (lf *LoginForm) Clear() {
 	lf.UsernameEntry.SetText("")
 	lf.PasswordEntry.SetText("")
@@ -94,7 +79,7 @@ func (lf *LoginForm) Clear() {
 	lf.ErrorLabel.SetText("")
 }
 
-// ShowLoginError shows a login error dialog
+// ShowLoginError shows a login error in a dialog.
 func ShowLoginError(window fyne.Window, message string) {
 	dialog.ShowError(errors.New(message), window)
 }

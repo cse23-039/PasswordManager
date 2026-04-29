@@ -59,10 +59,12 @@ type BackupInfo struct {
 
 // NewVaultAdmin creates an admin interface for the vault
 func NewVaultAdmin(vault *VaultWithUser) *VaultAdmin {
-	homeDir, _ := os.UserHomeDir()
+	// Store backups alongside the vault file so they share the same location
+	// that the user already knows about (e.g. %APPDATA%/PasswordManager/backups).
+	backupDir := filepath.Join(filepath.Dir(vault.Vault.filePath), "backups")
 	return &VaultAdmin{
 		vault:     vault,
-		backupDir: filepath.Join(homeDir, ".password-manager", "backups"),
+		backupDir: backupDir,
 	}
 }
 
@@ -179,14 +181,7 @@ func (va *VaultAdmin) RestoreBackup(backupID, targetPath string) error {
 		return fmt.Errorf("backup not found: %s", backupID)
 	}
 
-	// Validate backup file can be parsed as a vault file (basic sanity check).
-	if _, err := readVaultFile(backupPath); err != nil {
-		va.vault.auditLog.LogVaultOperation(username, AuditEventVaultRestore,
-			"Restore failed: backup file format invalid or corrupted", false)
-		return fmt.Errorf("backup file invalid: %w", err)
-	}
-
-	// Write to target atomically: copy to temp and rename
+	// Read backup into memory first so we can validate before touching anything.
 	data, err := os.ReadFile(backupPath)
 	if err != nil {
 		va.vault.auditLog.LogVaultOperation(username, AuditEventVaultRestore,
@@ -194,6 +189,27 @@ func (va *VaultAdmin) RestoreBackup(backupID, targetPath string) error {
 		return fmt.Errorf("failed to read backup: %w", err)
 	}
 
+	// Reject backups that are not in V2 (AES-256-GCM) format.
+	if len(data) <= len(vaultMagicV2) || string(data[:len(vaultMagicV2)]) != vaultMagicV2 {
+		va.vault.auditLog.LogVaultOperation(username, AuditEventVaultRestore,
+			"Restore failed: backup is not V2 encrypted format", false)
+		return fmt.Errorf("backup uses an insecure legacy format and cannot be restored; re-save it with the current version first")
+	}
+
+	// Validate the backup parses correctly.
+	if _, err := readVaultFile(backupPath); err != nil {
+		va.vault.auditLog.LogVaultOperation(username, AuditEventVaultRestore,
+			"Restore failed: backup file format invalid or corrupted", false)
+		return fmt.Errorf("backup file invalid: %w", err)
+	}
+
+	// Safety copy: preserve the current live vault before overwriting it.
+	safetyPath := targetPath + ".pre-restore.bak"
+	if existing, readErr := os.ReadFile(targetPath); readErr == nil {
+		_ = os.WriteFile(safetyPath, existing, 0600)
+	}
+
+	// Write to target atomically: write to temp then rename.
 	tmp := targetPath + ".restore.tmp"
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		va.vault.auditLog.LogVaultOperation(username, AuditEventVaultRestore,

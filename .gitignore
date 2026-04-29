@@ -8,6 +8,9 @@ dist/
 *.so
 *.dylib
 
+# Minisign secret key — never commit this
+release.sec
+
 # Vault data files — never commit credentials or audit logs
 data/
 *.pwm

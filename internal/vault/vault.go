@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -48,13 +49,9 @@ const (
 	auditMagic = "\x89PWA\r\n\x1a\n"
 )
 
-// legacyAppFileKey decrypts existing companion files from older releases.
-var legacyAppFileKey = [32]byte{
-	0x7f, 0x4a, 0x23, 0x91, 0xbc, 0x5e, 0x08, 0xd4,
-	0x6f, 0x30, 0xa7, 0x12, 0x85, 0xcc, 0x4b, 0xe9,
-	0x1d, 0x76, 0x0f, 0x53, 0x24, 0xab, 0x98, 0x67,
-	0x3e, 0xd5, 0x41, 0xf2, 0x8b, 0x0c, 0x9a, 0x56,
-}
+// legacyAppFileKey was removed. Companion files encrypted with the old
+// hardcoded key are no longer supported. Users with such files must
+// re-register or restore from a backup created with a current build.
 
 // loadOrCreateAppSeed returns the 32-byte random seed stored at seedPath,
 // creating it (0600) if it does not yet exist. The seed is mixed into
@@ -75,6 +72,11 @@ func loadOrCreateAppSeed(seedPath string) []byte {
 
 // deriveAppDataKey derives the companion-file key from machine/user identity
 // mixed with a per-vault random seed. PM_APP_DATA_KEY overrides for deployments.
+//
+// Security note: if PM_APP_DATA_KEY is set, keep it out of process listings and
+// container inspection output (e.g. use Docker secrets, not plain environment
+// variables in docker-compose), since it is visible via /proc/<pid>/environ or
+// `docker inspect`.
 func deriveAppDataKey(seed []byte) [32]byte {
 	if override := strings.TrimSpace(os.Getenv("PM_APP_DATA_KEY")); override != "" {
 		sum := sha256.Sum256([]byte(override))
@@ -116,17 +118,17 @@ func (v *Vault) encryptAppData(plaintext []byte) ([]byte, error) {
 }
 
 // decryptAppData decrypts data produced by encryptAppData.
+// Tries the seeded key first, then falls back to the legacy seedless derivation
+// for companion files written before the per-vault seed was introduced.
 func (v *Vault) decryptAppData(data []byte) ([]byte, error) {
 	if pt, err := decryptAppDataWithKey(data, deriveAppDataKey(v.appSeed)); err == nil {
 		return pt, nil
 	}
-	// Backward compat: files written before the seed was introduced used the
-	// old seedless key derivation.
+	// Fallback: files written before the seed was introduced used seedless derivation.
 	if pt, err := decryptAppDataWithKey(data, deriveAppDataKey(nil)); err == nil {
 		return pt, nil
 	}
-	// Backward compatibility for companion files written with the legacy embedded key.
-	return decryptAppDataWithKey(data, legacyAppFileKey)
+	return nil, errors.New("failed to decrypt companion file: key derivation produced no valid result")
 }
 
 func decryptAppDataWithKey(data []byte, key [32]byte) ([]byte, error) {
@@ -218,16 +220,37 @@ type VaultFile struct {
 
 // Vault is the main vault manager
 type Vault struct {
-	mu              sync.RWMutex
-	filePath        string
-	appSeed         []byte    // random per-vault seed mixed into companion-file key derivation
-	encryptionKey   []byte
-	hmacKey         []byte
-	isUnlocked      bool
-	header          *VaultHeader
-	entries         map[string]*SecretData // Decrypted entries in memory (cleared on lock)
-	dirty           bool                   // Has unsaved changes
-	lastAppSaveTime time.Time              // OS mod-time recorded after every app-initiated save
+	mu                 sync.RWMutex
+	filePath           string
+	appSeed            []byte    // random per-vault seed mixed into companion-file key derivation
+	encryptionKey      []byte
+	hmacKey            []byte
+	isUnlocked         bool
+	header             *VaultHeader
+	entries            map[string]*SecretData // Decrypted entries in memory (cleared on lock)
+	dirty              bool                   // Has unsaved changes
+	lastAppSaveTime    time.Time              // OS mod-time recorded after every app-initiated save
+	maxPasswordHistory int                    // capped by policy; defaults to 20
+
+	// Debounced-write support: rapid sequential mutations coalesce into a
+	// single disk write that fires saveDebounceDelay after the last mutation.
+	saveTimer *time.Timer
+}
+
+const saveDebounceDelay = 500 * time.Millisecond
+
+// SetMaxPasswordHistory configures how many past password hashes are retained per secret.
+// Call this after loading the security policy so the vault respects the configured limit.
+func (v *Vault) SetMaxPasswordHistory(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > 100 {
+		n = 100
+	}
+	v.mu.Lock()
+	v.maxPasswordHistory = n
+	v.mu.Unlock()
 }
 
 // NewVault creates a new vault instance
@@ -447,6 +470,34 @@ func (v *Vault) UnlockWithKey(encKey, hmacKey []byte) error {
 	return nil
 }
 
+// scheduleSave coalesces rapid sequential writes into a single disk flush.
+// Must be called with v.mu held (write lock). The timer fires outside the
+// lock so saveToFile re-acquires it safely.
+func (v *Vault) scheduleSave() {
+	if v.saveTimer != nil {
+		v.saveTimer.Stop()
+	}
+	v.saveTimer = time.AfterFunc(saveDebounceDelay, func() {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		if v.dirty && v.isUnlocked {
+			if err := v.saveToFile(); err != nil {
+				fmt.Fprintf(os.Stderr, "vault: background save failed: %v\n", err)
+			}
+		}
+	})
+}
+
+// flushSave cancels any pending debounced save and writes immediately.
+// Must be called with v.mu held (write lock).
+func (v *Vault) flushSave() error {
+	if v.saveTimer != nil {
+		v.saveTimer.Stop()
+		v.saveTimer = nil
+	}
+	return v.saveToFile()
+}
+
 // Lock closes the vault and clears sensitive data from memory
 func (v *Vault) Lock() error {
 	v.mu.Lock()
@@ -456,9 +507,9 @@ func (v *Vault) Lock() error {
 		return errors.New("vault is not unlocked")
 	}
 
-	// Save any unsaved changes
+	// Flush any pending debounced save before clearing keys.
 	if v.dirty {
-		if err := v.saveToFile(); err != nil {
+		if err := v.flushSave(); err != nil {
 			return fmt.Errorf("failed to save vault before locking: %w", err)
 		}
 	}
@@ -533,8 +584,9 @@ func (v *Vault) AddSecret(secret *SecretData) error {
 	v.entries[secret.ID] = &stored
 	v.dirty = true
 
-	// Auto-save
-	return v.saveToFile()
+	// Debounced save: coalesces rapid sequential adds into one disk write.
+	v.scheduleSave()
+	return nil
 }
 
 // GetSecret retrieves a secret by ID
@@ -601,11 +653,14 @@ func (v *Vault) UpdateSecret(secret *SecretData) error {
 			Salt:      salt,
 			ChangedAt: time.Now(),
 		}
-		// Build a new history slice, capped at 20 most recent entries
+		// Build a new history slice, capped at the policy-configured limit.
 		prevHist := make([]PasswordHistoryEntry, len(existing.PasswordHistory))
 		copy(prevHist, existing.PasswordHistory)
 		prevHist = append(prevHist, historyEntry)
-		const maxHistory = 20
+		maxHistory := v.maxPasswordHistory
+		if maxHistory <= 0 {
+			maxHistory = 20 // safe default when policy hasn't been applied yet
+		}
 		if len(prevHist) > maxHistory {
 			prevHist = prevHist[len(prevHist)-maxHistory:]
 		}
@@ -635,7 +690,8 @@ func (v *Vault) UpdateSecret(secret *SecretData) error {
 	v.entries[secret.ID] = &stored
 	v.dirty = true
 
-	return v.saveToFile()
+	v.scheduleSave()
+	return nil
 }
 
 // DeleteSecret removes a secret from the vault
@@ -654,7 +710,8 @@ func (v *Vault) DeleteSecret(id string) error {
 	delete(v.entries, id)
 	v.dirty = true
 
-	return v.saveToFile()
+	v.scheduleSave()
+	return nil
 }
 
 func scrubSecretForListing(secret *SecretData) *SecretData {
@@ -664,7 +721,8 @@ func scrubSecretForListing(secret *SecretData) *SecretData {
 	return &secretCopy
 }
 
-// ListSecrets returns all secrets (metadata only, passwords masked)
+// ListSecrets returns all secrets (metadata only, passwords masked), sorted
+// alphabetically by name for deterministic, stable UI ordering.
 func (v *Vault) ListSecrets() ([]*SecretData, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -677,7 +735,9 @@ func (v *Vault) ListSecrets() ([]*SecretData, error) {
 	for _, secret := range v.entries {
 		secrets = append(secrets, scrubSecretForListing(secret))
 	}
-
+	sort.Slice(secrets, func(i, j int) bool {
+		return strings.ToLower(secrets[i].Name) < strings.ToLower(secrets[j].Name)
+	})
 	return secrets, nil
 }
 
@@ -690,13 +750,16 @@ func (v *Vault) SearchSecrets(query string, category string, tags []string) ([]*
 		return nil, errors.New("vault is locked")
 	}
 
+	// Lower the query once to avoid per-entry allocation inside the loop.
+	queryLower := strings.ToLower(query)
+
 	var results []*SecretData
 
 	for _, secret := range v.entries {
 		match := true
 
-		// Filter by query (name contains)
-		if query != "" && !containsIgnoreCase(secret.Name, query) {
+		// Filter by query (name contains, case-insensitive)
+		if queryLower != "" && !strings.Contains(strings.ToLower(secret.Name), queryLower) {
 			match = false
 		}
 
@@ -727,6 +790,9 @@ func (v *Vault) SearchSecrets(query string, category string, tags []string) ([]*
 		}
 	}
 
+	sort.Slice(results, func(i, j int) bool {
+		return strings.ToLower(results[i].Name) < strings.ToLower(results[j].Name)
+	})
 	return results, nil
 }
 
@@ -791,22 +857,29 @@ func (v *Vault) ChangeMasterPassword(currentPassword, newPassword string) error 
 	return v.saveToFile()
 }
 
-// ExportVault exports the vault to a new file (backup)
+// ExportVault exports the vault to a new file (backup).
+// Acquires a write lock so any pending debounced save is flushed before
+// the on-disk file is read, guaranteeing the export reflects all in-memory state.
 func (v *Vault) ExportVault(exportPath string) error {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
+	v.mu.Lock()
+	defer v.mu.Unlock()
 
 	if !v.isUnlocked {
 		return errors.New("vault is locked")
 	}
 
-	// Read current vault file
+	// Flush any pending debounced write so the on-disk file is current.
+	if v.dirty {
+		if err := v.flushSave(); err != nil {
+			return fmt.Errorf("failed to flush vault before export: %w", err)
+		}
+	}
+
 	data, err := os.ReadFile(v.filePath)
 	if err != nil {
 		return fmt.Errorf("failed to read vault: %w", err)
 	}
 
-	// Write to export path
 	if err := os.WriteFile(exportPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write export: %w", err)
 	}
@@ -934,11 +1007,137 @@ func (v *Vault) GetStats() (map[string]interface{}, error) {
 	return stats, nil
 }
 
+// VaultHealthReport summarises the security posture of secrets in the vault.
+type VaultHealthReport struct {
+	// Password hygiene
+	Total       int      // all non-system secrets
+	Weak        int      // password scores < 3 (missing char classes or < 12 chars)
+	Old         int      // password not changed in > 1 year
+	Reused      int      // password value shared by ≥ 2 entries
+	NoPassword  int      // entry has an empty password field
+	WeakNames   []string // display names of weak-password entries (capped at 20)
+	OldNames    []string // display names of stale-password entries (capped at 20)
+	ReusedNames []string // display names of first occurrence of each reused value (capped at 20)
+
+	// Security integrity indicators (populated by VaultWithUser.GetHealthReport)
+	VaultFileTampered  bool // true if vault file was modified outside the app since last save
+	AuditChainIntact   bool // true if HMAC chain across all audit entries is unbroken
+	AuditVerified      int  // count of audit entries with a valid checksum
+	AuditTampered      int  // count of audit entries with an invalid checksum
+	AuditUnverifiable  int  // count of audit entries with no checksum (legacy/pre-signing)
+	MFAEnabled         bool // true if the current user has MFA enabled and verified
+	HasSecurityPolicy  bool // true if an admin security policy has been configured
+	MFARequired        bool // true if the security policy mandates MFA
+	PasswordExpiryDays int  // policy password rotation interval in days (0 = disabled)
+}
+
+// GetHealthReport scans all decrypted in-memory secrets and returns a health summary.
+func (v *Vault) GetHealthReport() (*VaultHealthReport, error) {
+	return v.computeHealthReport("")
+}
+
+// computeHealthReport is the internal implementation.
+// ownerFilter restricts analysis to secrets whose CreatedBy matches the given
+// username (case-insensitive). Pass "" to include every non-system secret.
+func (v *Vault) computeHealthReport(ownerFilter string) (*VaultHealthReport, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	if !v.isUnlocked {
+		return nil, errors.New("vault is locked")
+	}
+
+	report := &VaultHealthReport{}
+	passwordFreq := make(map[string][]string) // password → list of secret names
+	oneYearAgo := time.Now().Add(-365 * 24 * time.Hour)
+
+	for _, s := range v.entries {
+		if s.Category == "__SYSTEM__" {
+			continue
+		}
+		if ownerFilter != "" && !strings.EqualFold(s.CreatedBy, ownerFilter) {
+			continue
+		}
+		report.Total++
+
+		pw := s.Password
+
+		if pw == "" {
+			report.NoPassword++
+			continue
+		}
+
+		// Strength check: award one point per satisfied criterion
+		score := 0
+		if len(pw) >= 12 {
+			score++
+		}
+		for _, c := range pw {
+			if c >= 'A' && c <= 'Z' {
+				score++
+				break
+			}
+		}
+		for _, c := range pw {
+			if c >= 'a' && c <= 'z' {
+				score++
+				break
+			}
+		}
+		for _, c := range pw {
+			if c >= '0' && c <= '9' {
+				score++
+				break
+			}
+		}
+		for _, c := range pw {
+			if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+				score++
+				break
+			}
+		}
+		if score < 3 {
+			report.Weak++
+			if len(report.WeakNames) < 20 {
+				report.WeakNames = append(report.WeakNames, s.Name)
+			}
+		}
+
+		// Age check
+		age := s.UpdatedAt
+		if age.IsZero() {
+			age = s.CreatedAt
+		}
+		if !age.IsZero() && age.Before(oneYearAgo) {
+			report.Old++
+			if len(report.OldNames) < 20 {
+				report.OldNames = append(report.OldNames, s.Name)
+			}
+		}
+
+		// Reuse tracking
+		passwordFreq[pw] = append(passwordFreq[pw], s.Name)
+	}
+
+	// Identify reused passwords
+	for _, names := range passwordFreq {
+		if len(names) >= 2 {
+			report.Reused += len(names)
+			if len(report.ReusedNames) < 20 {
+				report.ReusedNames = append(report.ReusedNames, names[0])
+			}
+		}
+	}
+
+	return report, nil
+}
+
 // ============================================
 // INTERNAL FUNCTIONS
 // ============================================
 
-// deriveKeys derives encryption and HMAC keys from password using Argon2id
+// deriveKeys derives encryption and HMAC keys from password using Argon2id,
+// then locks both key slices into RAM so the OS cannot swap them to disk.
 func deriveKeys(password string, salt []byte) (encKey, hmacKey []byte) {
 	// Derive 64 bytes: 32 for encryption, 32 for HMAC
 	derivedKey := argon2.IDKey(
@@ -950,7 +1149,19 @@ func deriveKeys(password string, salt []byte) (encKey, hmacKey []byte) {
 		64, // 32 + 32 bytes
 	)
 
-	return derivedKey[:32], derivedKey[32:]
+	enc := make([]byte, 32)
+	mac := make([]byte, 32)
+	copy(enc, derivedKey[:32])
+	copy(mac, derivedKey[32:])
+
+	// Zero the combined derivation buffer before it is GC'd.
+	for i := range derivedKey {
+		derivedKey[i] = 0
+	}
+
+	lockMemory(enc)
+	lockMemory(mac)
+	return enc, mac
 }
 
 // createVerificationHash creates a hash to verify the master password
@@ -1100,15 +1311,25 @@ func (v *Vault) saveToFile() error {
 
 	// Build V2 file:
 	//   [vaultMagicV2][base64(salt)]\n[base64(nonce)]\n[base64(ciphertext)]\n[hex(HMAC)]\n
-	var buf []byte
-	buf = append(buf, []byte(vaultMagicV2)...)
-	buf = append(buf, []byte(base64.StdEncoding.EncodeToString(v.header.Salt))...)
+	//
+	// Pre-calculate the final size so a single allocation covers the entire output,
+	// avoiding up to 7 incremental re-allocations from repeated appends.
+	saltB64 := base64.StdEncoding.EncodeToString(v.header.Salt)
+	nonceB64 := base64.StdEncoding.EncodeToString(encNonce)
+	ctB64 := base64.StdEncoding.EncodeToString(ciphertext)
+	macHex := fmt.Sprintf("%x", fileMAC)
+
+	estimatedSize := len(vaultMagicV2) + len(saltB64) + 1 +
+		len(nonceB64) + 1 + len(ctB64) + 1 + len(macHex) + 1
+	buf := make([]byte, 0, estimatedSize)
+	buf = append(buf, vaultMagicV2...)
+	buf = append(buf, saltB64...)
 	buf = append(buf, '\n')
-	buf = append(buf, []byte(base64.StdEncoding.EncodeToString(encNonce))...)
+	buf = append(buf, nonceB64...)
 	buf = append(buf, '\n')
-	buf = append(buf, []byte(base64.StdEncoding.EncodeToString(ciphertext))...)
+	buf = append(buf, ctB64...)
 	buf = append(buf, '\n')
-	buf = append(buf, []byte(fmt.Sprintf("%x", fileMAC))...)
+	buf = append(buf, macHex...)
 	buf = append(buf, '\n')
 
 	// Ensure directory exists
@@ -1232,15 +1453,18 @@ func (v *Vault) CheckExternalModification() bool {
 	return info.ModTime().After(v.lastAppSaveTime.Add(time.Second))
 }
 
-// clearSensitiveData securely clears sensitive data from memory
+// clearSensitiveData securely clears sensitive data from memory.
+// Keys are unlocked from RAM (reversing lockMemory) then zeroed before release.
 func (v *Vault) clearSensitiveData() {
-	// Clear encryption key
+	// Unlock then zero encryption key
+	unlockMemory(v.encryptionKey)
 	for i := range v.encryptionKey {
 		v.encryptionKey[i] = 0
 	}
 	v.encryptionKey = nil
 
-	// Clear HMAC key
+	// Unlock then zero HMAC key
+	unlockMemory(v.hmacKey)
 	for i := range v.hmacKey {
 		v.hmacKey[i] = 0
 	}
@@ -1280,7 +1504,3 @@ func generateID() string {
 	return base64.URLEncoding.EncodeToString(b)
 }
 
-// containsIgnoreCase checks if s contains substr (case-insensitive)
-func containsIgnoreCase(s, substr string) bool {
-	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
-}

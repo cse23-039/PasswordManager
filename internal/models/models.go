@@ -11,38 +11,9 @@ type User struct {
 	MFASecret    string    `json:"mfa_secret,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
-	Locked       bool      `json:"locked"`
-	LockedUntil  time.Time `json:"locked_until,omitempty"`
-	LastLogin    time.Time `json:"last_login,omitempty"`
+	Locked    bool      `json:"locked"` // manual admin lock; see VaultWithUser.LockoutUntil for timed lockout
+	LastLogin time.Time `json:"last_login,omitempty"`
 	Email        string    `json:"email,omitempty"`
-}
-
-// Secret represents a stored secret/credential
-type Secret struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Username    string            `json:"username"`
-	Password    string            `json:"password"`
-	URL         string            `json:"url,omitempty"`
-	Notes       string            `json:"notes,omitempty"`
-	Category    string            `json:"category,omitempty"`
-	Tags        []string          `json:"tags,omitempty"`
-	CustomField map[string]string `json:"custom_fields,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
-	CreatedBy   string            `json:"created_by"`
-	Version     int               `json:"version"`
-	History     []SecretHistory   `json:"history,omitempty"`
-}
-
-// SecretHistory stores previous versions of a secret
-type SecretHistory struct {
-	// Hash of the previous password (salted). Passwords MUST NOT be stored in plaintext.
-	Hash      []byte    `json:"hash"`
-	Salt      []byte    `json:"salt,omitempty"`
-	ChangedAt time.Time `json:"changed_at"`
-	ChangedBy string    `json:"changed_by"`
-	Reason    string    `json:"reason,omitempty"`
 }
 
 // AuditLog represents an audit log entry

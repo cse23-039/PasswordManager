@@ -107,7 +107,7 @@ func NewDefaultVaultSettings() *VaultSettings {
 			PasswordExpiryDays:    90,
 			PasswordHistoryCount:  5,
 			MFARequired:           true,
-			MFAGracePeriodDays:    7,
+			MFAGracePeriodDays:    1,
 			SessionTimeoutMins:    30,
 			MaxFailedAttempts:     5,
 			LockoutDurationMins:   15,
@@ -216,8 +216,12 @@ func (v *VaultWithUser) HasVaultAccessKey() bool {
 }
 
 // SetVaultAccessKey hashes and stores a new vault access key in the vault settings.
-// Must be called while the vault is unlocked. Key must be at least 8 characters.
+// Must be called while the vault is unlocked. Requires CanManagePolicy permission.
+// Key must be at least 8 characters.
 func (v *VaultWithUser) SetVaultAccessKey(key string) error {
+	if err := v.checkSecretPermission(auth.CanManagePolicy); err != nil {
+		return fmt.Errorf("permission denied: %w", err)
+	}
 	if len(key) < 8 {
 		return fmt.Errorf("vault access key must be at least 8 characters")
 	}
@@ -232,7 +236,12 @@ func (v *VaultWithUser) SetVaultAccessKey(key string) error {
 	settings.VaultAccessKeyHash = hashUserPassword(key, salt)
 	settings.VaultAccessKeySalt = salt
 	settings.UpdatedAt = time.Now()
-	return v.SaveSettings(settings)
+	if saveErr := v.SaveSettings(settings); saveErr != nil {
+		return saveErr
+	}
+	v.auditLog.LogEvent(v.userProfile.Username, AuditEventPolicyChange,
+		AuditCategoryAdmin, "Vault access key set", AuditResultSuccess)
+	return nil
 }
 
 // VerifyVaultAccessKey checks the supplied key against the stored hash.
@@ -251,7 +260,11 @@ func (v *VaultWithUser) VerifyVaultAccessKey(key string) (bool, error) {
 }
 
 // ClearVaultAccessKey removes the vault access key requirement entirely.
+// Requires CanManagePolicy permission.
 func (v *VaultWithUser) ClearVaultAccessKey() error {
+	if err := v.checkSecretPermission(auth.CanManagePolicy); err != nil {
+		return fmt.Errorf("permission denied: %w", err)
+	}
 	settings, err := v.GetSettings()
 	if err != nil || settings == nil {
 		return fmt.Errorf("failed to load settings: %w", err)
@@ -259,7 +272,14 @@ func (v *VaultWithUser) ClearVaultAccessKey() error {
 	settings.VaultAccessKeyHash = nil
 	settings.VaultAccessKeySalt = nil
 	settings.UpdatedAt = time.Now()
-	return v.SaveSettings(settings)
+	if saveErr := v.SaveSettings(settings); saveErr != nil {
+		return saveErr
+	}
+	if v.userProfile != nil {
+		v.auditLog.LogEvent(v.userProfile.Username, AuditEventPolicyChange,
+			AuditCategoryAdmin, "Vault access key cleared", AuditResultSuccess)
+	}
+	return nil
 }
 
 // ============================================
@@ -298,6 +318,10 @@ func (v *VaultWithUser) UpdateSecurityPolicy(policy *PersistentSecurityPolicy) e
 	// Enforce audit retention immediately: prune entries older than the new limit.
 	if policy.AuditRetentionDays > 0 {
 		v.auditLog.PruneOldEntries(policy.AuditRetentionDays)
+	}
+	// Apply password history limit to the vault so it uses the policy value.
+	if policy.PasswordHistoryCount > 0 {
+		v.Vault.SetMaxPasswordHistory(policy.PasswordHistoryCount)
 	}
 	return nil
 }

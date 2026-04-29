@@ -15,6 +15,15 @@ import (
 
 const repoAPI = "https://api.github.com/repos/KagisoSetwaba/password-manager/releases/latest"
 
+// releasePublicKey is the minisign Ed25519 public key used to verify release binaries.
+// Generate a key pair with: minisign -G
+// Commit only the public key (the "RWS..." string from the .pub file) here.
+//
+// WARNING: This MUST be set before shipping. An empty key means downloaded update
+// binaries are applied without any signature verification, allowing a MITM attacker
+// to deliver a malicious binary. Set this to your minisign public key string.
+const releasePublicKey = "RWRLQvwxh7LJqwBxoavT1Wg+OAKEYond+HZ58bO0uv38mFziugBbQ82a"
+
 type Release struct {
 	TagName string  `json:"tag_name"`
 	HTMLURL string  `json:"html_url"`
@@ -60,16 +69,22 @@ func CheckForUpdate(current string) (*Release, error) {
 
 // ApplyUpdate downloads the new binary for the current OS and replaces the running exe.
 // progress is called with (bytesDownloaded, totalBytes) during the download.
+// When releasePublicKey is set, the binary's minisign signature is verified before apply.
+// Returns an error if releasePublicKey is empty (signature verification disabled).
 func ApplyUpdate(release *Release, progress func(downloaded, total int64)) error {
-	url, err := findAssetURL(release)
+	if releasePublicKey == "" {
+		return fmt.Errorf("update aborted: releasePublicKey is not configured; set it to your minisign public key before shipping")
+	}
+	binaryURL, err := findAssetURL(release)
 	if err != nil {
 		return err
 	}
 
 	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Get(url)
+
+	resp, err := client.Get(binaryURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -78,7 +93,21 @@ func ApplyUpdate(release *Release, progress func(downloaded, total int64)) error
 		src = &progressReader{r: resp.Body, total: resp.ContentLength, fn: progress}
 	}
 
-	return selfupdate.Apply(src, selfupdate.Options{})
+	opts := selfupdate.Options{}
+
+	// Attach signature verifier when a public key is configured.
+	// selfupdate.Verifier.LoadFromURL fetches the .minisig file and verifies
+	// the binary bytes before they are written to disk.
+	if releasePublicKey != "" {
+		sigURL := binaryURL + ".minisig"
+		v := selfupdate.NewVerifier()
+		if err := v.LoadFromURL(sigURL, releasePublicKey, nil); err != nil {
+			return fmt.Errorf("signature verification failed: %w", err)
+		}
+		opts.Verifier = v
+	}
+
+	return selfupdate.Apply(src, opts)
 }
 
 func findAssetURL(release *Release) (string, error) {

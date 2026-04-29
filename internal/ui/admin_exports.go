@@ -8,7 +8,6 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
 )
 
 // ensureExt appends ext to path if it doesn't already have that extension.
@@ -32,30 +31,22 @@ func NewAdminExportsUI(window fyne.Window) *AdminExportsUI {
 
 // GetExportView creates the export/report view
 func (ae *AdminExportsUI) GetExportView(onExportJSON, onExportCSV, onExportCEF func(string), onComplianceReport func()) *fyne.Container {
-	title := widget.NewLabelWithStyle("Reports & Exports", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-
-	// Audit log export section
-	auditSection := container.NewVBox(
-		widget.NewLabelWithStyle("Audit Log Export", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Export audit logs for SIEM integration or compliance review"),
+	auditContent := container.NewVBox(
 		container.NewHBox(
-			widget.NewButtonWithIcon("Export JSON", theme.DocumentIcon(), func() {
+			makeSecondaryBtn("Export JSON", theme.DocumentIcon(), func() {
 				ae.showSaveDialog("audit_log.json", onExportJSON)
 			}),
-			widget.NewButtonWithIcon("Export CSV", theme.DocumentIcon(), func() {
+			makeSecondaryBtn("Export CSV", theme.DocumentIcon(), func() {
 				ae.showSaveDialog("audit_log.csv", onExportCSV)
 			}),
-			widget.NewButtonWithIcon("Export CEF", theme.DocumentIcon(), func() {
+			makeSecondaryBtn("Export CEF", theme.DocumentIcon(), func() {
 				ae.showSaveDialog("audit_log.cef", onExportCEF)
 			}),
 		),
 	)
 
-	// Compliance report section
-	complianceSection := container.NewVBox(
-		widget.NewLabelWithStyle("Compliance Reports", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Generate compliance and security assessment reports"),
-		widget.NewButtonWithIcon("Generate Compliance Report", theme.InfoIcon(), func() {
+	complianceContent := container.NewVBox(
+		makePrimaryBtn("Generate Compliance Report", theme.InfoIcon(), func() {
 			if onComplianceReport != nil {
 				onComplianceReport()
 			}
@@ -63,11 +54,11 @@ func (ae *AdminExportsUI) GetExportView(onExportJSON, onExportCSV, onExportCEF f
 	)
 
 	return container.NewVBox(
-		title,
-		widget.NewSeparator(),
-		auditSection,
-		widget.NewSeparator(),
-		complianceSection,
+		makeCenteredHeading("Reports & Exports"),
+		makeDivider(),
+		makeSectionCard("Audit Log Export", "Export audit logs for SIEM integration or compliance review", auditContent),
+		makeDivider(),
+		makeSectionCard("Compliance Reports", "Generate compliance and security assessment reports", complianceContent),
 	)
 }
 

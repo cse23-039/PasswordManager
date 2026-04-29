@@ -14,6 +14,7 @@ type ClipboardManager struct {
 	clipboardFunc func(string) error // Platform-specific clipboard function
 	clearFunc     func() error       // Platform-specific clear function
 	lastCopied    time.Time
+	generation    uint64 // incremented on every copy; timer only clears if generation matches
 }
 
 // NewClipboardManager creates a new clipboard manager with the specified timeout
@@ -35,7 +36,9 @@ func (cm *ClipboardManager) SetClipboardFunctions(copyFn func(string) error, cle
 	cm.clearFunc = clearFn
 }
 
-// CopyToClipboard copies text to the clipboard and schedules auto-clear
+// CopyToClipboard copies text to the clipboard and schedules auto-clear.
+// Each call increments an internal generation counter so a delayed timer from
+// a previous copy cannot clear a freshly-copied value.
 func (cm *ClipboardManager) CopyToClipboard(text string) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -53,27 +56,24 @@ func (cm *ClipboardManager) CopyToClipboard(text string) error {
 	}
 
 	cm.lastCopied = time.Now()
+	cm.generation++
+	gen := cm.generation
 
-	// Schedule clipboard clear. The ClearClipboard callback will check the
-	// lastCopied timestamp to avoid clearing a newer copy if an older timer
-	// fires late.
 	cm.clearTimer = time.AfterFunc(cm.clearTimeout, func() {
-		cm.ClearClipboard()
+		cm.clearIfGeneration(gen)
 	})
 
 	return nil
 }
 
-// ClearClipboard clears the clipboard contents
-func (cm *ClipboardManager) ClearClipboard() {
+// clearIfGeneration clears the clipboard only if the current generation
+// matches gen, preventing a stale timer from wiping a newer copy.
+func (cm *ClipboardManager) clearIfGeneration(gen uint64) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Only clear if the lastCopied time is older than the configured timeout.
-	// This prevents an old timer firing after a new copy from clearing the
-	// fresh clipboard contents.
-	if time.Since(cm.lastCopied) < cm.clearTimeout {
-		return
+	if cm.generation != gen {
+		return // a newer copy supersedes this timer
 	}
 
 	if cm.clearFunc != nil {
@@ -84,6 +84,22 @@ func (cm *ClipboardManager) ClearClipboard() {
 		cm.clearTimer.Stop()
 		cm.clearTimer = nil
 	}
+}
+
+// ClearClipboard clears the clipboard contents immediately.
+func (cm *ClipboardManager) ClearClipboard() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.clearFunc != nil {
+		_ = cm.clearFunc()
+	}
+
+	if cm.clearTimer != nil {
+		cm.clearTimer.Stop()
+		cm.clearTimer = nil
+	}
+	cm.generation++ // invalidate any pending timer
 }
 
 // SetTimeout updates the clipboard clear timeout

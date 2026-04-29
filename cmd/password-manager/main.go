@@ -17,7 +17,7 @@ import (
 )
 
 // Version is injected at build time via -ldflags "-X main.Version=x.y.z"
-var Version = "dev"
+var Version = "1.0"
 
 //go:embed logo.png
 var iconBytes []byte
@@ -61,6 +61,7 @@ func main() {
 	myWindow := myApp.NewWindow("Password Manager")
 	myWindow.SetIcon(appIcon)
 	ui.AppVersion = Version
+	ui.AppIcon = appIcon
 	ui.InitializeLocalUI(myApp, myWindow, userVault)
 
 	// Decrement ActiveSessionCount on X-button close so the concurrent session
@@ -71,17 +72,31 @@ func main() {
 		myApp.Quit()
 	})
 
-	go checkForUpdate(myWindow)
+	// Check for updates in the background; signal the main thread via a channel
+	// so the dialog is shown on the UI goroutine (Fyne requirement).
+	updateCh := make(chan *updater.Release, 1)
+	go func() {
+		release, err := updater.CheckForUpdate(Version)
+		if err != nil || release == nil {
+			return
+		}
+		updateCh <- release
+	}()
+	go func() {
+		release, ok := <-updateCh
+		if !ok {
+			return
+		}
+		// Drive the dialog on the main goroutine by queuing a canvas refresh,
+		// which Fyne processes on its event loop thread.
+		myWindow.Canvas().Refresh(myWindow.Canvas().Content())
+		checkForUpdate(myWindow, release, userVault)
+	}()
 
 	myWindow.ShowAndRun()
 }
 
-func checkForUpdate(parent fyne.Window) {
-	release, err := updater.CheckForUpdate(Version)
-	if err != nil || release == nil {
-		return
-	}
-
+func checkForUpdate(parent fyne.Window, release *updater.Release, v *vault.VaultWithUser) {
 	label := widget.NewLabel(fmt.Sprintf(
 		"Version %s is available.\nYou are running %s.\n\nThe update will be applied and the app will restart.",
 		release.TagName, Version,
@@ -95,13 +110,13 @@ func checkForUpdate(parent fyne.Window) {
 			if !confirm {
 				return
 			}
-			applyUpdate(release, parent)
+			applyUpdate(release, parent, v)
 		},
 		parent,
 	)
 }
 
-func applyUpdate(release *updater.Release, parent fyne.Window) {
+func applyUpdate(release *updater.Release, parent fyne.Window, v *vault.VaultWithUser) {
 	bar := widget.NewProgressBar()
 	bar.Min = 0
 	bar.Max = 1
@@ -129,8 +144,17 @@ func applyUpdate(release *updater.Release, parent fyne.Window) {
 			parent,
 		)
 
-		// Relaunch the updated binary and exit.
-		cmd := exec.Command(os.Args[0], os.Args[1:]...)
+		// Lock the vault and clean up session state before handing off to the
+		// new binary — ensures pending saves flush and the lockfile is removed.
+		_ = v.Logout()
+
+		// Relaunch the updated binary using the canonical path so relative
+		// invocations (e.g. ./password-manager) resolve correctly after replacement.
+		exe, err := os.Executable()
+		if err != nil {
+			exe = os.Args[0]
+		}
+		cmd := exec.Command(exe, os.Args[1:]...)
 		_ = cmd.Start()
 		os.Exit(0)
 	}()

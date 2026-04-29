@@ -22,7 +22,10 @@ type unicodeTheme struct {
 
 var (
 	// isDarkMode tracks the current theme variant. Defaults to dark.
-	isDarkMode = true
+	// Protected by isDarkMu because the inactivity goroutine can read it
+	// concurrently with the UI thread writing it on a theme-toggle tap.
+	isDarkMode bool = true
+	isDarkMu   sync.RWMutex
 
 	// Cached font resources – loaded once, reused on every theme switch.
 	cachedFontReg  fyne.Resource
@@ -53,13 +56,19 @@ func NewUnicodeTheme() fyne.Theme {
 	}
 }
 
-// IsDarkMode returns whether dark mode is currently active.
-func IsDarkMode() bool { return isDarkMode }
+// IsDarkMode returns whether dark mode is currently active (thread-safe).
+func IsDarkMode() bool {
+	isDarkMu.RLock()
+	defer isDarkMu.RUnlock()
+	return isDarkMode
+}
 
 // SetDarkMode switches between dark and light mode and immediately refreshes
-// every widget in the running application.
+// every widget in the running application (thread-safe).
 func SetDarkMode(app fyne.App, dark bool) {
+	isDarkMu.Lock()
 	isDarkMode = dark
+	isDarkMu.Unlock()
 	app.Settings().SetTheme(NewUnicodeTheme())
 }
 
@@ -88,7 +97,7 @@ func (t *unicodeTheme) Font(style fyne.TextStyle) fyne.Resource {
 
 // Color returns custom palette colors for a modern dark/light theme.
 func (t *unicodeTheme) Color(name fyne.ThemeColorName, _ fyne.ThemeVariant) color.Color {
-	if isDarkMode {
+	if IsDarkMode() {
 		switch name {
 		case theme.ColorNameBackground:
 			return color.RGBA{R: 13, G: 17, B: 23, A: 255} // #0d1117
@@ -202,7 +211,7 @@ func (t *unicodeTheme) Size(name fyne.ThemeSizeName) float32 {
 
 // accentColor returns the primary blue accent for the current mode.
 func accentColor() color.Color {
-	if isDarkMode {
+	if IsDarkMode() {
 		return color.RGBA{R: 47, G: 129, B: 247, A: 255} // #2f81f7
 	}
 	return color.RGBA{R: 9, G: 105, B: 218, A: 255} // #0969da
@@ -210,8 +219,56 @@ func accentColor() color.Color {
 
 // sidebarBgColor returns the sidebar background color for the current mode.
 func sidebarBgColor() color.Color {
-	if isDarkMode {
+	if IsDarkMode() {
 		return color.RGBA{R: 22, G: 27, B: 34, A: 255} // #161b22
 	}
-	return color.RGBA{R: 208, G: 215, B: 222, A: 255} // #d0d7de — clearly darker than #f6f8fa content
+	return color.RGBA{R: 240, G: 243, B: 246, A: 255} // #f0f3f6 — light mode sidebar
+}
+
+// cardBgColor returns a slightly elevated background for cards vs the window background.
+func cardBgColor() color.Color {
+	if IsDarkMode() {
+		return color.RGBA{R: 22, G: 27, B: 34, A: 255} // #161b22
+	}
+	return color.RGBA{R: 255, G: 255, B: 255, A: 255} // #ffffff
+}
+
+// subtleBorderColor returns a low-contrast border/divider color.
+func subtleBorderColor() color.Color {
+	if IsDarkMode() {
+		return color.RGBA{R: 48, G: 54, B: 61, A: 255} // #30363d
+	}
+	return color.RGBA{R: 208, G: 215, B: 222, A: 255} // #d0d7de
+}
+
+// hoverBgColor returns a semi-transparent overlay for list row hover states.
+func hoverBgColor() color.Color {
+	if IsDarkMode() {
+		return color.RGBA{R: 48, G: 54, B: 61, A: 120} // #30363d ~47%
+	}
+	return color.RGBA{R: 232, G: 236, B: 241, A: 120} // #e8ecf1 ~47%
+}
+
+// successColor returns the success/green color.
+func successColor() color.Color {
+	if IsDarkMode() {
+		return color.RGBA{R: 63, G: 185, B: 80, A: 255}
+	}
+	return color.RGBA{R: 26, G: 127, B: 55, A: 255}
+}
+
+// warningColor returns the warning/orange color.
+func warningColor() color.Color {
+	if IsDarkMode() {
+		return color.RGBA{R: 210, G: 153, B: 34, A: 255}
+	}
+	return color.RGBA{R: 154, G: 103, B: 0, A: 255}
+}
+
+// dangerColor returns the error/red color.
+func dangerColor() color.Color {
+	if IsDarkMode() {
+		return color.RGBA{R: 248, G: 81, B: 73, A: 255}
+	}
+	return color.RGBA{R: 207, G: 34, B: 46, A: 255}
 }

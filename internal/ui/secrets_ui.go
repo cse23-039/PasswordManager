@@ -82,12 +82,20 @@ func (s *SecretsListUI) GetSecretsTable(
 
 			// Right side buttons (index 1 in border objects is the trailing object)
 			btns := border.Objects[1].(*fyne.Container)
-			password := sec.Password
+			// Capture ID and name — not sec.Password, which is scrubbed to ""
+			// by ListSecrets. Fetch the full secret at copy time so the password
+			// is only in memory for the duration of the tap handler.
+			secretID := sec.ID
 			name := sec.Name
 			btns.Objects[0].(*widget.Button).OnTapped = func() {
-				if onCopy != nil {
-					onCopy(password)
+				if onCopy == nil {
+					return
 				}
+				full, err := s.vault.GetSecretAudited(secretID)
+				if err != nil || full == nil {
+					return
+				}
+				onCopy(full.Password)
 			}
 			btns.Objects[1].(*widget.Button).OnTapped = func() {
 				if onDelete != nil {
@@ -97,14 +105,10 @@ func (s *SecretsListUI) GetSecretsTable(
 		},
 	)
 
-	header := widget.NewLabelWithStyle(
-		fmt.Sprintf("Secrets (%d)", len(secrets)),
-		fyne.TextAlignLeading,
-		fyne.TextStyle{Bold: true},
-	)
+	header := makeHeading(fmt.Sprintf("Secrets (%d)", len(secrets)))
 
 	return container.NewBorder(
-		container.NewVBox(header, widget.NewSeparator()),
+		container.NewVBox(header, makeDivider()),
 		nil, nil, nil,
 		list,
 	)

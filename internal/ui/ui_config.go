@@ -5,7 +5,10 @@ import (
 )
 
 // AppVersion is set by main before InitializeLocalUI so the UI can display it.
-var AppVersion = "dev"
+var AppVersion = "1.0"
+
+// AppIcon is set by main before InitializeLocalUI so the sidebar can show the app logo.
+var AppIcon fyne.Resource
 
 // UIConfig holds UI configuration settings
 type UIConfig struct {

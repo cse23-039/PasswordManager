@@ -33,29 +33,29 @@ func (a *AppUI) Initialize() {
 // ShowAboutDialog displays an about dialog
 func ShowAboutDialog(window fyne.Window) {
 	aboutContent := container.NewVBox(
-		widget.NewLabelWithStyle("Password Manager", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Version: 1.0.0"),
-		widget.NewSeparator(),
+		makeCenteredHeading("Password Manager"),
+		widget.NewLabel("Version: " + AppVersion),
+		makeDivider(),
 		widget.NewLabel("Secure password management with:"),
 		widget.NewLabel("• AES-256-GCM encryption"),
 		widget.NewLabel("• Argon2id key derivation"),
 		widget.NewLabel("• TOTP multi-factor authentication"),
 		widget.NewLabel("• Role-based access control"),
 		widget.NewLabel("• Tamper-resistant audit logging"),
-		widget.NewSeparator(),
+		makeDivider(),
 		widget.NewLabel("Local vault file (.pwm) storage"),
 	)
+
+	closeBtn := makeLowBtn("Close", theme.CancelIcon(), nil)
 
 	aboutDialog := widget.NewModalPopUp(
 		container.NewVBox(
 			aboutContent,
-			widget.NewButtonWithIcon("Close", theme.CancelIcon(), nil),
+			closeBtn,
 		),
 		window.Canvas(),
 	)
 
-	// Set close handler
-	closeBtn := aboutDialog.Content.(*fyne.Container).Objects[1].(*widget.Button)
 	closeBtn.OnTapped = func() {
 		aboutDialog.Hide()
 	}
